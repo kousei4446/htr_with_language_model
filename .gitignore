@@ -1,2 +1,6 @@
 /raw_data
 /data/IAM/processed_lines
+/__pycache__
+*.pyc
+*.pt
+/def_htrnet
