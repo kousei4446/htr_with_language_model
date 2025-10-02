@@ -111,31 +111,54 @@ class CTCtopR(nn.Module):
 
         return y
 
+
+class Connector1D(nn.Module):
+    """(B, T, D_in) -> (B, T, d_llm)"""
+    def __init__(self, d_in, d_llm=512):
+        super().__init__()
+        self.proj = nn.Linear(d_in, d_llm)
+        self.ln = nn.LayerNorm(d_llm)
+    def forward(self, x):  # x: (B, T, D_in)
+        return self.ln(self.proj(x))
+    
+    
 class CTCtopB(nn.Module):
-    def __init__(self, input_size, rnn_cfg, nclasses, rnn_type='gru'):
+    def __init__(self, input_size, rnn_cfg, nclasses, rnn_type='gru',d_llm=512, enable_connector=True):
         super(CTCtopB, self).__init__()
 
         hidden, num_layers = rnn_cfg
-
-        if rnn_type == 'gru':
-            self.rec = nn.GRU(input_size, hidden, num_layers=num_layers, bidirectional=True, dropout=.2)
-        elif rnn_type == 'lstm':
-            self.rec = nn.LSTM(input_size, hidden, num_layers=num_layers, bidirectional=True, dropout=.2)
-        else:
-            print('problem! - no such rnn type is defined')
-            exit()
         
+        RNN = nn.GRU if rnn_type == 'gru' else nn.LSTM
+        
+        self.rec1 = RNN(input_size, hidden, num_layers=1, bidirectional=True, dropout=0.0)
+        
+        self.recN = None
+        if num_layers > 1:
+            self.recN = RNN(2*hidden, hidden, num_layers=num_layers-1, bidirectional=True, dropout=.2)
+            
         self.fnl = nn.Sequential(nn.Dropout(.5), nn.Linear(2 * hidden, nclasses))
 
         self.cnn = nn.Sequential(nn.Dropout(.5), 
                                  nn.Conv2d(input_size, nclasses, kernel_size=(1, 3), stride=1, padding=(0, 1))
         )
-
+        
+        
+        self.connector = Connector1D(2*hidden, d_llm) if enable_connector else None
+        self.llm_prefix = None  # 学習ループから参照するための置き場
+        
+        
     def forward(self, x):
 
         y = x.permute(2, 3, 0, 1)[0]
-        y = self.rec(y)[0]
-
+        y1 = self.rec1(y)[0]
+        
+        if (self.connector is not None) and self.training:
+            y1_bt = y1.permute(1, 0, 2).contiguous()   # (B, T, 2H)
+            self.llm_prefix = self.connector(y1_bt)    # (B, T, d_llm)
+        else:
+            self.llm_prefix = None
+            
+        y = self.recN(y1)[0]
         y = self.fnl(y)
 
         if self.training:
