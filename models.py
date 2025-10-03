@@ -112,15 +112,6 @@ class CTCtopR(nn.Module):
         return y
 
 
-class Connector1D(nn.Module):
-    """(B, T, D_in) -> (B, T, d_llm)"""
-    def __init__(self, d_in, d_llm=512):
-        super().__init__()
-        self.proj = nn.Linear(d_in, d_llm)
-        self.ln = nn.LayerNorm(d_llm)
-    def forward(self, x):  # x: (B, T, D_in)
-        return self.ln(self.proj(x))
-    
     
 class CTCtopB(nn.Module):
     def __init__(self, input_size, rnn_cfg, nclasses, rnn_type='gru',d_llm=512, enable_connector=True):
@@ -143,20 +134,10 @@ class CTCtopB(nn.Module):
         )
         
         
-        self.connector = Connector1D(2*hidden, d_llm) if enable_connector else None
-        self.llm_prefix = None  # 学習ループから参照するための置き場
-        
-        
     def forward(self, x):
 
         y = x.permute(2, 3, 0, 1)[0]
         y1 = self.rec1(y)[0]
-        
-        if (self.connector is not None) and self.training:
-            y1_bt = y1.permute(1, 0, 2).contiguous()   # (B, T, 2H)
-            self.llm_prefix = self.connector(y1_bt)    # (B, T, d_llm)
-        else:
-            self.llm_prefix = None
             
         y = self.recN(y1)[0]
         y = self.fnl(y)
@@ -205,17 +186,6 @@ class HTRNet(nn.Module):
         y = self.top(y)
 
         return y
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
     
     
     
