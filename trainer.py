@@ -228,10 +228,10 @@ class HTRTrainer(nn.Module):
 
     def save(self, epoch):
         print('####################### Saving model at epoch {} #######################'.format(epoch))
-        if not os.path.exists('./saved_models'):
-            os.makedirs('models')
+        if not os.path.exists('./saved_models/mobilevit'):
+            os.makedirs('saved_models/mobilevit')
 
-        torch.save(self.net.cpu().state_dict(), './saved_models/htrnet_{}.pt'.format(epoch))
+        torch.save(self.net.cpu().state_dict(), './saved_models/mobilevit/htrnet_{}.pt'.format(epoch))
         self.net.to(self.config.device)
 
 
@@ -260,6 +260,9 @@ if __name__ == '__main__':
 
         htr_trainer.train(epoch)
         htr_trainer.scheduler.step()
+        
+        if epoch == 1:
+            htr_trainer.save(epoch)
 
         # save and evaluate the current model
         if epoch % config.train.save_every_k_epochs == 0:
@@ -268,7 +271,7 @@ if __name__ == '__main__':
             htr_trainer.test(epoch, 'test')
 
     # save the final model
-    if not os.path.exists('./saved_models'):
-        os.makedirs('./saved_models')
-    torch.save(htr_trainer.net.cpu().state_dict(), './saved_models/{}'.format(config.save))
+    if not os.path.exists('./saved_models/mobilevit'):
+        os.makedirs('./saved_models/mobilevit')
+    torch.save(htr_trainer.net.cpu().state_dict(), './saved_models/mobilevit/{}'.format(config.save))
     
