@@ -36,3 +36,8 @@ eval:
   batch_size: 32
   num_workers: 8
   wer_mode: 'tokenizer' # select from 'tokenizer', 'space'
+
+
+# model saving and logging
+model:
+  save_dir: './saved_models/htr'
