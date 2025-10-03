@@ -40,4 +40,4 @@ eval:
 
 # model saving and logging
 model:
-  save_dir: './saved_models/htr'
+  save_dir: './saved_models/'
