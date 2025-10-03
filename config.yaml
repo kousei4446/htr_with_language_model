@@ -14,7 +14,7 @@ preproc:
 
 # architecture
 arch: 
-  cnn_cfg: [[2, 64], 'M', [3, 128], 'M', [2, 256]]
+  cnn_cfg: [[2, 64], 'M', "mobilevit1", [3, 128], 'M' ,"mobilevit2", [2, 256]]
   head_type: 'both'  # select from 'both' (rnn + cnn shortcut), 'rnn', 'cnn'
   rnn_type: 'lstm'
   rnn_layers: 3
