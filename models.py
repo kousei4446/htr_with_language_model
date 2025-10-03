@@ -178,7 +178,8 @@ class HTRNet(nn.Module):
             self.stn = None
 
         cnn_cfg = arch_cfg.cnn_cfg
-        self.features = CNN(arch_cfg.cnn_cfg, flattening=arch_cfg.flattening)
+
+        self.features = HybridBackboneCRNNMobileViT(flattening=arch_cfg.flattening)
 
         if arch_cfg.flattening=='maxpool' or arch_cfg.flattening=='avgpool':
             hidden = cnn_cfg[-1][-1]
@@ -203,4 +204,107 @@ class HTRNet(nn.Module):
         y = self.features(x)
         y = self.top(y)
 
+        return y
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+class MobileViTBlock(nn.Module):
+    def __init__(self, in_channels, d_model=80, heads=8, num_layers=1,
+                 mlp_dim=160, patch=4):   # ← 正方パッチ4 or 8
+        super().__init__()
+        self.p = patch
+
+        self.local = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(in_channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(in_channels, d_model, 1, bias=False),
+            nn.BatchNorm2d(d_model),
+            nn.SiLU(inplace=True),
+        )
+
+        enc = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=heads, dim_feedforward=mlp_dim,
+            dropout=0.0, activation='gelu', batch_first=False, norm_first=True
+        )
+        self.transformer = nn.TransformerEncoder(enc, num_layers=num_layers)
+
+        self.fusion = nn.Sequential(
+            nn.Conv2d(d_model + in_channels, in_channels, 1, bias=False),
+            nn.BatchNorm2d(in_channels),
+            nn.SiLU(inplace=True),
+        )
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        p = self.p
+        # 128x1024固定なら常に真。可変入力が来たら早期に落とす。
+        assert (H % p == 0) and (W % p == 0), f"H,W must be multiples of {p}"
+
+        y = self.local(x)  # (B, d, H, W)
+        B, d, H, W = y.shape
+        Hp, Wp = H // p, W // p
+
+        # (B,d,H,W) -> (p*p, B*Hp*Wp, d)
+        y = y.view(B, d, Hp, p, Wp, p).permute(3, 5, 0, 2, 4, 1).contiguous()
+        y = y.view(p*p, B*Hp*Wp, d)
+
+        y = self.transformer(y)
+
+        # back to (B,d,H,W)
+        y = y.view(p, p, B, Hp, Wp, d).permute(2, 5, 3, 0, 4, 1).contiguous()
+        y = y.view(B, d, H, W)
+
+        out = torch.cat([x, y], dim=1)
+        out = self.fusion(out)
+        return out
+
+class HybridBackboneCRNNMobileViT(nn.Module):
+    def __init__(self, flattening='maxpool'):
+        super().__init__()
+        self.flattening = flattening
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(1, 32, 7, stride=2, padding=3, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+        )
+
+        self.res1 = nn.Sequential(BasicBlock(32,64), BasicBlock(64,64))
+        self.pool1 = nn.MaxPool2d(2,2)
+        self.mvit1 = MobileViTBlock(64, d_model=80, heads=8, num_layers=1, mlp_dim=160, patch=4)
+
+        self.res2 = nn.Sequential(*[BasicBlock(64,128)]+[BasicBlock(128,128)]*3)
+        self.pool2 = nn.MaxPool2d(2,2)
+        self.mvit2 = MobileViTBlock(128, d_model=80, heads=8, num_layers=1, mlp_dim=160, patch=8)
+
+        self.res3 = nn.Sequential(*[BasicBlock(128,256)]+[BasicBlock(256,256)]*3)
+        self.out_channels = 256
+
+    def forward(self, x):
+        y = self.stem(x)          # (B,32,64,512)
+        y = self.res1(y)          # (B,64,64,512)
+        y = self.pool1(y)         # (B,64,32,256)
+        y = self.mvit1(y)         # (B,64,32,256)
+        y = self.res2(y)          # (B,128,32,256)
+        y = self.pool2(y)         # (B,128,16,128)
+        y = self.mvit2(y)         # (B,128,16,128)
+        y = self.res3(y)          # (B,256,16,128)
+
+        # Column MaxPool → (B,256,1,128)
+        if self.flattening == 'maxpool':
+            y = F.max_pool2d(y, kernel_size=(y.size(2), 1), stride=(y.size(2), 1))
+        else:
+            y = F.avg_pool2d(y, kernel_size=(y.size(2), 1), stride=(y.size(2), 1))
         return y
