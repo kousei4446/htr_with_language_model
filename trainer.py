@@ -228,10 +228,12 @@ class HTRTrainer(nn.Module):
 
     def save(self, epoch):
         print('####################### Saving model at epoch {} #######################'.format(epoch))
-        if not os.path.exists('./saved_models/mobilevit'):
-            os.makedirs('saved_models/mobilevit')
 
-        torch.save(self.net.cpu().state_dict(), './saved_models/mobilevit/htrnet_{}.pt'.format(epoch))
+        if not os.path.exists(config.model.save_dir):
+            os.makedirs(config.model.save_dir)
+
+        torch.save(self.net.cpu().state_dict(), config.model.save_dir + '/{}.pt'.format(epoch))
+
         self.net.to(self.config.device)
 
 
@@ -271,7 +273,9 @@ if __name__ == '__main__':
             htr_trainer.test(epoch, 'test')
 
     # save the final model
-    if not os.path.exists('./saved_models/mobilevit'):
-        os.makedirs('./saved_models/mobilevit')
-    torch.save(htr_trainer.net.cpu().state_dict(), './saved_models/mobilevit/{}'.format(config.save))
+
+    if not os.path.exists(config.model.save_dir):
+        os.makedirs(config.model.save_dir)
+    torch.save(htr_trainer.net.cpu().state_dict(), config.model.save_dir + '/{}'.format(config.save))
+
     
