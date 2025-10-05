@@ -37,7 +37,7 @@ class CNN(nn.Module):
         self.k = 1
         self.flattening = flattening
 
-        self.features = nn.ModuleList([nn.Conv2d(1, 32, 7, [4, 2], 3), nn.ReLU()])
+        self.features = nn.ModuleList([nn.Conv2d(1, 32, 7, (2,2), 3), nn.ReLU()])        
         in_channels = 32
         cntm = 0
         cnt = 1
@@ -181,3 +181,57 @@ class HTRNet(nn.Module):
         y = self.top(y)
 
         return y
+    
+    
+    
+
+class MobileViTBlock(nn.Module):
+    def __init__(self, in_channels, d_model=80, heads=8, num_layers=1,
+                 mlp_dim=160, patch=4):   # ← 正方パッチ4 or 8
+        super().__init__()
+        self.p = patch
+
+        self.local = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(in_channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(in_channels, d_model, 1, bias=False),
+            nn.BatchNorm2d(d_model),
+            nn.SiLU(inplace=True),
+        )
+
+        enc = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=heads, dim_feedforward=mlp_dim,
+            dropout=0.0, activation='gelu', batch_first=False, norm_first=True
+        )
+        self.transformer = nn.TransformerEncoder(enc, num_layers=num_layers)
+
+        self.fusion = nn.Sequential(
+            nn.Conv2d(d_model + in_channels, in_channels, 1, bias=False),
+            nn.BatchNorm2d(in_channels),
+            nn.SiLU(inplace=True),
+        )
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        p = self.p
+        # 128x1024固定なら常に真。可変入力が来たら早期に落とす。
+        assert (H % p == 0) and (W % p == 0), f"H,W must be multiples of {p}"
+
+        y = self.local(x)  # (B, d, H, W)
+        B, d, H, W = y.shape
+        Hp, Wp = H // p, W // p
+
+        # (B,d,H,W) -> (p*p, B*Hp*Wp, d)
+        y = y.view(B, d, Hp, p, Wp, p).permute(3, 5, 0, 2, 4, 1).contiguous()
+        y = y.view(p*p, B*Hp*Wp, d)
+
+        y = self.transformer(y)
+
+        # back to (B,d,H,W)
+        y = y.view(p, p, B, Hp, Wp, d).permute(2, 5, 3, 0, 4, 1).contiguous()
+        y = y.view(B, d, H, W)
+
+        out = torch.cat([x, y], dim=1)
+        out = self.fusion(out)
+        return out

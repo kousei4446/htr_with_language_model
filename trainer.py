@@ -106,7 +106,7 @@ class HTRTrainer(nn.Module):
 
     def prepare_optimizers(self):
         config = self.config
-        optimizer = torch.optim.AdamW(self.net.parameters(), config.train.lr, weight_decay=0.00005)
+        optimizer = torch.optim.Adam(self.net.parameters(), config.train.lr, betas=(0.9, 0.999), weight_decay=0.0)
 
         self.optimizer = optimizer
 
@@ -260,7 +260,10 @@ if __name__ == '__main__':
 
         htr_trainer.train(epoch)
         htr_trainer.scheduler.step()
-
+        
+        if epoch == 1 :
+            htr_trainer.save(epoch)
+            
         # save and evaluate the current model
         if epoch % config.train.save_every_k_epochs == 0:
             htr_trainer.save(epoch)
