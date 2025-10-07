@@ -16,6 +16,47 @@ from utils.transforms import aug_transforms
 import torch.nn.functional as F
 
 from utils.metrics import CER, WER
+import re, torch
+
+def migrate_rec_to_both(state: dict) -> dict:
+    """Stage1の top.rec.* を Stage2の top.rec1.* / top.recN.* に写し替え。"""
+    out = dict(state)
+    pat = re.compile(r"^top\.rec\.(weight_ih|weight_hh|bias_ih|bias_hh)_l(\d+)(?:(_reverse))?$")
+    for k, v in list(state.items()):
+        m = pat.match(k)
+        if not m:
+            continue
+        kind, lvl, rev = m.group(1), int(m.group(2)), (m.group(3) or "")
+        newk = f"top.rec1.{kind}_l0{rev}" if lvl == 0 else f"top.recN.{kind}_l{lvl-1}{rev}"
+        out.setdefault(newk, v)  # 既にあれば触らない
+    return out
+
+def init_from_stage1(net: torch.nn.Module, ckpt_path: str, *, verbose: bool = True):
+    """Stage1 ckptで Stage2モデルを初期化（必要なら rec→rec1/recN に自動マップ）。"""
+    print(f"[init] load: {ckpt_path}")
+    obj = torch.load(ckpt_path, map_location="cpu")
+    state = obj.get("state_dict", obj.get("model", obj))
+
+    # DataParallel 'module.' 剥がし
+    if any(k.startswith("module.") for k in state):
+        state = {k.replace("module.", "", 1): v for k, v in state.items()}
+
+    # モデル側が rec1/recN なのに ckpt が rec.* ならキーをマップ
+    msd = net.state_dict()
+    need_both = any(k.startswith(("top.rec1.", "top.recN.")) for k in msd.keys())
+    has_rec   = any(k.startswith("top.rec.") for k in state.keys())
+    if need_both and has_rec:
+        state = migrate_rec_to_both(state)
+
+    # 形状一致だけ安全に流し込む
+    safe = {k: v for k, v in state.items() if (k in msd) and (msd[k].shape == v.shape)}
+    incompat = net.load_state_dict(safe, strict=False)
+
+    if verbose:
+        print(f"[init] loaded {len(safe)}/{len(msd)} params")
+        if hasattr(incompat, "missing_keys"):
+            print(f"[init] missing={len(incompat.missing_keys)} unexpected={len(incompat.unexpected_keys)}")
+    return incompat
 
 class HTRTrainer(nn.Module):
     def __init__(self, config):
@@ -89,10 +130,8 @@ class HTRTrainer(nn.Module):
         net = HTRNet(config.arch, len(classes) + 1)
         
         if config.resume is not None:
-            print('resuming from checkpoint: {}'.format(config.resume))
-            load_dict = torch.load(config.resume)
-            load_status = net.load_state_dict(load_dict, strict=True)
-            print(load_status)
+            _ = init_from_stage1(net, config.resume) 
+            
         net.to(device)
 
         # print number of parameters
