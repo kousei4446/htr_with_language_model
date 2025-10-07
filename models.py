@@ -1,6 +1,7 @@
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 class BasicBlock(nn.Module):
     expansion = 1
@@ -28,6 +29,53 @@ class BasicBlock(nn.Module):
         out = F.relu(out)
         return out
 
+
+class LLaMAConnectorCLM(nn.Module):
+    def __init__(self, hidden_size, llama_model="meta-llama/Meta-Llama-3-8B-Instruct",
+                 n_down=5):
+        super().__init__()
+        self.tok = AutoTokenizer.from_pretrained(llama_model)
+        self.llm = AutoModelForCausalLM.from_pretrained(llama_model)
+        for p in self.llm.parameters():
+            p.requires_grad = False  # LLMは凍結
+
+        d_llm = self.llm.config.hidden_size
+        # 時間圧縮: (B, T, 2H) <-> Conv1d は (B, C, T) 前提
+        downs = []
+        for _ in range(n_down):  # 合計 / (2**n_down) ≈ /32
+            downs += [nn.Conv1d(2*hidden_size, 2*hidden_size, 3, stride=2, padding=1),
+                      nn.GELU()]
+        self.down = nn.Sequential(*downs)
+        self.proj = nn.Linear(2*hidden_size, d_llm)
+
+    def forward(self, y1_TBL, text_input_ids, attention_mask):
+        # y1_TBL: (T, B, 2H)
+        T, B, C = y1_TBL.shape
+        z = y1_TBL.permute(1, 2, 0)           # (B, 2H, T)
+        z = self.down(z)                       # (B, 2H, T')
+        z = z.permute(0, 2, 1)                 # (B, T', 2H)
+        htr_emb = self.proj(z)               # (B, T', d_llm)
+
+        # テキストを埋め込み化（ラベルは ids をそのまま使用）
+        text_emb = self.llm.get_input_embeddings()(text_input_ids)   # (B, L, d_llm)
+
+        # 連結プロンプト: [htr_emb] + テキストの <bos..L-1>
+        inputs_embeds = torch.cat([htr_emb, text_emb[:, :-1]], dim=1)  # (B, T'+L-1, d)
+        # マスクも連結
+        audio_mask = torch.ones(htr_emb.size()[:2], dtype=attention_mask.dtype,
+                                device=attention_mask.device)
+        attn = torch.cat([audio_mask, attention_mask[:, :-1]], dim=1)    # (B, T'+L-1)
+
+        # ラベル: 中間表現は無視(-100)、テキストは次トークン（right-shift）
+        B, L = text_input_ids.shape
+        Tprime = htr_emb.size(1)
+        labels = torch.full((B, Tprime + L - 1), -100, dtype=text_input_ids.dtype,
+                            device=text_input_ids.device)
+        labels[:, Tprime:] = text_input_ids[:, 1:]  # teach next token only on text part
+
+        out = self.llm(inputs_embeds=inputs_embeds, attention_mask=attn, labels=labels)
+        return out.loss  # これが L_CLM
+    
 
 
 class MobileViTBlock(nn.Module):
@@ -176,7 +224,8 @@ class CTCtopR(nn.Module):
 
     
 class CTCtopB(nn.Module):
-    def __init__(self, input_size, rnn_cfg, nclasses, rnn_type='gru',d_llm=512, enable_connector=True):
+    def __init__(self, input_size, rnn_cfg, nclasses, rnn_type='gru',
+                 llama_model=None, lail_weight=0.1): 
         super(CTCtopB, self).__init__()
 
         hidden, num_layers = rnn_cfg
@@ -195,19 +244,29 @@ class CTCtopB(nn.Module):
                                  nn.Conv2d(input_size, nclasses, kernel_size=(1, 3), stride=1, padding=(0, 1))
         )
         
-        
-    def forward(self, x):
+        self.clm_weight = lail_weight   # CLM loss の重みとして再利用
+        self.llama_connector = LLaMAConnectorCLM(hidden, llama_model) if llama_model else None
+   
+
+
+    def forward(self, x, text_input_ids=None, attention_mask=None):
 
         y = x.permute(2, 3, 0, 1)[0]
         y1 = self.rec1(y)[0]
-            
+
+       # --- CLM 枝（勾配は y1→Backbone まで返る） ---
+        clm_loss = torch.tensor(0.0, device=y1.device)
+        if (self.llama_connector is not None) and (text_input_ids is not None) and (attention_mask is not None):
+            clm_loss = self.llama_connector(y1, text_input_ids, attention_mask) * self.clm_weight
+
+
+
         y = self.recN(y1)[0]
         y = self.fnl(y)
-
-        if self.training:
-            return y, self.cnn(x).permute(2, 3, 0, 1)[0]
-        else:
-            return y, self.cnn(x).permute(2, 3, 0, 1)[0]
+       # --- CLM 枝（勾配は y1→Backbone まで返る） ---
+        clm_loss = torch.tensor(0.0, device=y1.device)
+        if (self.llama_connector is not None) and (text_input_ids is not None) and (attention_mask is not None):
+            clm_loss = self.llama_connector(y1, text_input_ids, attention_mask) * self.clm_weight
 
 
 class HTRNet(nn.Module):
@@ -236,17 +295,20 @@ class HTRNet(nn.Module):
         elif head=='rnn':
             self.top = CTCtopR(hidden, (arch_cfg.rnn_hidden_size, arch_cfg.rnn_layers), nclasses, rnn_type=arch_cfg.rnn_type)
         elif head=='both':
-            self.top = CTCtopB(hidden, (arch_cfg.rnn_hidden_size, arch_cfg.rnn_layers), nclasses, rnn_type=arch_cfg.rnn_type)
+            self.top = CTCtopB(hidden, (arch_cfg.rnn_hidden_size, arch_cfg.rnn_layers), nclasses, rnn_type=arch_cfg.rnn_type, llama_model="meta-llama/Meta-Llama-3-8B-Instruct",lail_weight=0.1)
 
-    def forward(self, x):
+    def forward(self, x, text_input_ids=None, attention_mask=None):
 
         if self.stn is not None:
             x = self.stn(x)
 
         y = self.features(x)
-        y = self.top(y)
-
-        return y
+        
+        # CTCtopB だけテキストを渡す
+        if isinstance(self.top, CTCtopB):
+            return self.top(y, text_input_ids, attention_mask)
+        else:
+            return self.top(y)
     
     
     

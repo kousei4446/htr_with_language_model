@@ -200,7 +200,12 @@ class HTRTrainer(nn.Module):
             img = img.to(device)
 
             if config.arch.head_type == "both":
-                output, aux_output = self.net(img)
+                # ここで LLaMA 用にトークナイズ
+                tok = self.net.top.llama_connector.tok
+                batch_tok = tok(list(transcr), padding=True, truncation=True, return_tensors="pt")
+                input_ids = batch_tok["input_ids"].to(device)
+                attention_mask = batch_tok["attention_mask"].to(device)
+                output, aux_output, clm_loss = self.net(img, input_ids, attention_mask)
             else:
                 output = self.net(img)
 
@@ -212,6 +217,7 @@ class HTRTrainer(nn.Module):
 
             if config.arch.head_type == "both":
                 loss_val += 0.1 * self.ctc_loss(aux_output, labels, act_lens, label_lens)
+                loss_val += clm_loss
 
             tloss_val = loss_val.item()
         
