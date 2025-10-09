@@ -17,6 +17,9 @@ import torch.nn.functional as F
 
 from utils.metrics import CER, WER
 
+from model_llm import llm_model, llm_tokenizer, llm_hidden_size
+from models import Connector1D
+
 class HTRTrainer(nn.Module):
     def __init__(self, config):
         super(HTRTrainer, self).__init__()
@@ -94,11 +97,16 @@ class HTRTrainer(nn.Module):
             load_status = net.load_state_dict(load_dict, strict=True)
             print(load_status)
         net.to(device)
-
-        # print number of parameters
-        n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
-        print('Number of parameters: {}'.format(n_params))
-
+        # ★ CTCtopB かつ Connector 有効なら LLM次元に合わせて差し替え＆デバイス移動
+        if hasattr(net.top, 'connector') and (net.top.connector is not None):
+            # d_llm を LLM の hidden_size に合わせ直す
+            if net.top.connector.ln.normalized_shape[0] != llm_hidden_size:
+                net.top.connector = Connector1D(
+                    d_in=net.top.connector.proj.in_features,
+                    d_llm=llm_hidden_size
+                )
+            # Connector は LLM と同じデバイスに置く（LLM損失の勾配はConnectorだけに流す）
+            net.top.connector.to(device)
         self.net = net
 
     def prepare_losses(self):
@@ -148,6 +156,7 @@ class HTRTrainer(nn.Module):
 
     def train(self, epoch):
 
+        alpha_llm = getattr(self.config.train, 'alpha_llm', 0.1)
         config = self.config
         device = config.device
 
@@ -174,12 +183,48 @@ class HTRTrainer(nn.Module):
             if config.arch.head_type == "both":
                 loss_val += 0.1 * self.ctc_loss(aux_output, labels, act_lens, label_lens)
 
-            tloss_val = loss_val.item()
+
+
+            llm_loss = torch.tensor(0.0, device=device)  # 表示用
+            if (config.arch.head_type == "both") and (self.net.top.llm_prefix is not None) and (alpha_llm > 0):
+                # B, Tp, D (Connectorは device_llm 上)
+                prefix = self.net.top.llm_prefix                         # (B, Tp, d_llm) on device_llm
+                B, Tp, _ = prefix.shape
+
+                # 目的文（GT転写）をトークナイズ（LLM側デバイス）
+                tok = llm_tokenizer(list(transcr), return_tensors='pt', padding=True, add_special_tokens=True)
+                input_ids = tok['input_ids'].to(device_llm)
+                attn      = tok['attention_mask'].to(device_llm)
+
+                # トークン埋め込みを取得
+                tok_emb = llm_model.get_input_embeddings()(input_ids)    # (B, L, d_llm)
+
+                # 先頭に soft prompt を連結
+                inputs_embeds = torch.cat([prefix, tok_emb], dim=1)      # (B, Tp+L, d_llm)
+                attn_prefix = torch.ones(B, Tp, dtype=attn.dtype, device=device_llm)
+                attn_full   = torch.cat([attn_prefix, attn], dim=1)
+
+                # prefix 部分の損失は無視（-100）
+                labels_full = torch.full_like(input_ids, fill_value=-100)
+                labels_full = torch.cat([torch.full((B, Tp), -100, device=device_llm, dtype=input_ids.dtype),
+                                        input_ids], dim=1)
+
+                out = llm_model(inputs_embeds=inputs_embeds,
+                                attention_mask=attn_full,
+                                labels=labels_full)
+                llm_loss = out.loss
+                loss_val = loss_val + alpha_llm * llm_loss.to(device)  # メインのdeviceへ乗せて合算
+
+            tloss_val = float(loss_val.item())
         
             loss_val.backward()
             self.optimizer.step()    
 
-            t.set_postfix(values='loss : {:.2f}'.format(tloss_val))
+            if config.arch.head_type == "both" and alpha_llm > 0:
+                t.set_postfix_str('loss: {:.2f} | llm: {:.2f}'.format(tloss_val, float(llm_loss.item())))
+            else:
+                t.set_postfix_str('loss: {:.2f}'.format(tloss_val))
+                t.set_postfix(values='loss : {:.2f}'.format(tloss_val))
 
         self.sample_decoding()
     

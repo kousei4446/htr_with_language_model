@@ -123,7 +123,7 @@ class Connector1D(nn.Module):
     
     
 class CTCtopB(nn.Module):
-    def __init__(self, input_size, rnn_cfg, nclasses, rnn_type='gru',d_llm=512, enable_connector=True):
+    def __init__(self, input_size, rnn_cfg, nclasses, rnn_type='gru',d_llm=2048, enable_connector=True):
         super(CTCtopB, self).__init__()
 
         hidden, num_layers = rnn_cfg
