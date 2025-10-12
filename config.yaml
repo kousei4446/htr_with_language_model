@@ -26,18 +26,18 @@ arch:
 train:
   lr: 1e-3
   num_epochs: 800
-  batch_size: 16
+  batch_size: 1
   scheduler: 'mstep'  # right now only 'mstep' is supported, i.e. multistep
   save_every_k_epochs: 50
   num_workers: 8
 
 # evaluation
 eval:
-  batch_size: 32
+  batch_size: 2
   num_workers: 8
   wer_mode: 'tokenizer' # select from 'tokenizer', 'space'
 
 
 # model saving and logging
 model:
-  save_dir: './saved_models/'
+  save_dir: './saved_models/llm'

@@ -111,15 +111,38 @@ class CTCtopR(nn.Module):
 
         return y
 
-
 class Connector1D(nn.Module):
-    """(B, T, D_in) -> (B, T, d_llm)"""
-    def __init__(self, d_in, d_llm=512):
+    """
+    (B, T, D_in) -> (B, T//ds_factor, d_llm)
+    - 分岐なし
+    - ds_factor=1 なら T はそのまま（Conv1d stride=1）
+    """
+    def __init__(self, d_in, d_llm=512, ds_factor=2, mid_mult=2, use_residual=True):
         super().__init__()
+        self.ds_factor = int(ds_factor)
+        d_mid = max(d_in, d_in * mid_mult)
+
+        # 学習的ダウンサンプル（ds=1 なら長さ不変）
+        self.down = nn.Sequential(
+            nn.Conv1d(d_in, d_mid, kernel_size=5, stride=self.ds_factor, padding=2, bias=False),
+            nn.BatchNorm1d(d_mid),
+            nn.GELU(),
+            nn.Conv1d(d_mid, d_in, kernel_size=1, bias=False),
+            nn.BatchNorm1d(d_in),
+        )
+
+        # 残差経路：AvgPool の kernel=stride=ds なので ds=1 なら恒等
+        self.skip = nn.AvgPool1d(kernel_size=self.ds_factor, stride=self.ds_factor) if use_residual else nn.Identity()
+
+        # LLM 向け投影
         self.proj = nn.Linear(d_in, d_llm)
         self.ln = nn.LayerNorm(d_llm)
-    def forward(self, x):  # x: (B, T, D_in)
-        return self.ln(self.proj(x))
+
+    def forward(self, x):                   # x: (B, T, D_in)
+        h = self.down(x.transpose(1, 2))    # (B, D, T//ds)
+        s = self.skip(x.transpose(1, 2))    # (B, D, T//ds)
+        y = F.gelu(h + s).transpose(1, 2)   # (B, T//ds, D_in)
+        return self.ln(self.proj(y))        # (B, T//ds, d_llm)
     
     
 class CTCtopB(nn.Module):
@@ -179,7 +202,7 @@ class HTRNet(nn.Module):
 
         cnn_cfg = arch_cfg.cnn_cfg
 
-        self.features = CNN(flattening=arch_cfg.flattening)
+        self.features = CNN(cnn_cfg, flattening=arch_cfg.flattening)
 
         if arch_cfg.flattening=='maxpool' or arch_cfg.flattening=='avgpool':
             hidden = cnn_cfg[-1][-1]

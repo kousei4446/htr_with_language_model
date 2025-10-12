@@ -17,13 +17,14 @@ import torch.nn.functional as F
 
 from utils.metrics import CER, WER
 
-from model_llm import llm_model, llm_tokenizer, llm_hidden_size
 from models import Connector1D
 
+
 class HTRTrainer(nn.Module):
-    def __init__(self, config):
-        super(HTRTrainer, self).__init__()
+    def __init__(self, config,htr_model=None,llm_model=None,llm_tokenizer=None,):
+        super().__init__()
         self.config = config
+
 
         self.prepare_dataloaders()
         self.prepare_net()
@@ -111,6 +112,22 @@ class HTRTrainer(nn.Module):
 
     def prepare_losses(self):
         self.ctc_loss = lambda y, t, ly, lt: nn.CTCLoss(reduction='sum', zero_infinity=True)(F.log_softmax(y, dim=2), t, ly, lt) /self.config.train.batch_size
+    
+    
+    def ctc_loss_safe(self, logp, labels, act_lens, label_lens):
+        """
+        logp: (T,N,C) on CUDA
+        labels/act_lens/label_lens: CPU 上の long/int64
+        """
+        crit = nn.CTCLoss(blank=0, reduction='sum', zero_infinity=True)
+        try:
+            # このブロックの間だけ cuDNN を切る（native CUDA 実装にフォールバック）
+            with torch.backends.cudnn.flags(enabled=False):
+                return crit(logp, labels, act_lens, label_lens) / self.config.train.batch_size
+        except RuntimeError:
+            # それでもダメなら CPU で計算（最終落下傘）
+            return crit(logp.cpu(), labels, act_lens, label_lens) / self.config.train.batch_size
+        
 
     def prepare_optimizers(self):
         config = self.config
@@ -125,11 +142,15 @@ class HTRTrainer(nn.Module):
             raise NotImplementedError('Alternative schedulers not implemented yet')
 
     def decode(self, tdec, tdict, blank_id=0):
-        
+        import numpy as np
+        tdec = np.asarray(tdec)
+        if tdec.ndim == 0:              # スカラーなら長さ1に
+            tdec = tdec.reshape(1)
+
         tt = [v for j, v in enumerate(tdec) if j == 0 or v != tdec[j - 1]]
-        dec_transcr = ''.join([tdict[t] for t in tt if t != blank_id])
-        
+        dec_transcr = ''.join([tdict[int(t)] for t in tt if int(t) != blank_id])
         return dec_transcr
+
                 
     def sample_decoding(self):
 
@@ -174,11 +195,31 @@ class HTRTrainer(nn.Module):
             else:
                 output = self.net(img)
 
-            act_lens = torch.IntTensor(img.size(0)*[output.size(0)])
-            labels = torch.IntTensor([self.classes['c2i'][c] for c in ''.join(transcr)])
-            label_lens = torch.IntTensor([len(t) for t in transcr])
+            # 出力 shape を主張（CTC は (T,N,C)）
+            assert output.dim() == 3, output.shape
+            T, N, C = output.shape  # output.size(0) が T、size(1) が N
 
-            loss_val = self.ctc_loss(output, labels, act_lens, label_lens)
+            # labels / lengths は CPU の long に固定
+            labels = torch.as_tensor([self.classes['c2i'][c] for c in ''.join(transcr)],
+                                    dtype=torch.long, device='cpu')
+            label_lens = torch.as_tensor([len(t) for t in transcr],
+                                        dtype=torch.long, device='cpu')
+            act_lens  = torch.as_tensor([T] * N, dtype=torch.long, device='cpu')
+
+            # 整合チェック（ズレてたらここで分かる）
+            assert labels.numel() == int(label_lens.sum())
+            assert (label_lens > 0).all() and (act_lens > 0).all()
+            assert (label_lens <= act_lens).all()
+            assert torch.isfinite(output).all(), "output has NaN/Inf"
+            if labels.numel() > 0:  # 空でなければ値域チェック
+                assert int(labels.min()) >= 0 and int(labels.max()) < C
+
+            # log-softmax は CUDA 上で (T,N,C)
+            logp = F.log_softmax(output, dim=2).contiguous()
+
+            # ★ cuDNN を避ける“安全CTC”を使用
+            loss_val = self.ctc_loss_safe(logp, labels, act_lens, label_lens)
+
 
             if config.arch.head_type == "both":
                 loss_val += 0.1 * self.ctc_loss(aux_output, labels, act_lens, label_lens)
@@ -187,33 +228,36 @@ class HTRTrainer(nn.Module):
 
             llm_loss = torch.tensor(0.0, device=device)  # 表示用
             if (config.arch.head_type == "both") and (self.net.top.llm_prefix is not None) and (alpha_llm > 0):
-                # B, Tp, D (Connectorは device_llm 上)
-                prefix = self.net.top.llm_prefix                         # (B, Tp, d_llm) on device_llm
-                B, Tp, _ = prefix.shape
+                # B, Tp, D (Connectorは device 上)
+                # LLM の dtype/device を取得
+                device_llm = next(llm_model.parameters()).device
+                lm_dtype   = next(llm_model.parameters()).dtype
 
-                # 目的文（GT転写）をトークナイズ（LLM側デバイス）
+                # prefix は Connector から来る（通常 float32）。LLM に合わせる！
+                prefix = self.net.top.llm_prefix.to(device_llm, dtype=lm_dtype)  # (B, Tp, d_llm)
+
+                # トークナイズ → ids/mask を LLM デバイスへ
                 tok = llm_tokenizer(list(transcr), return_tensors='pt', padding=True, add_special_tokens=True)
                 input_ids = tok['input_ids'].to(device_llm)
                 attn      = tok['attention_mask'].to(device_llm)
 
-                # トークン埋め込みを取得
-                tok_emb = llm_model.get_input_embeddings()(input_ids)    # (B, L, d_llm)
+                # 埋め込みは LLM と同じ dtype/device で返る想定
+                tok_emb = llm_model.get_input_embeddings()(input_ids)            # (B, L, d_llm)
 
-                # 先頭に soft prompt を連結
-                inputs_embeds = torch.cat([prefix, tok_emb], dim=1)      # (B, Tp+L, d_llm)
-                attn_prefix = torch.ones(B, Tp, dtype=attn.dtype, device=device_llm)
-                attn_full   = torch.cat([attn_prefix, attn], dim=1)
+                # 連結時点で dtype/device が揃っている状態にする
+                inputs_embeds = torch.cat([prefix, tok_emb], dim=1)              # (B, Tp+L, d_llm)
+                attn_prefix   = torch.ones(prefix.size(0), prefix.size(1), dtype=attn.dtype, device=device_llm)
+                attn_full     = torch.cat([attn_prefix, attn], dim=1)
 
-                # prefix 部分の損失は無視（-100）
                 labels_full = torch.full_like(input_ids, fill_value=-100)
-                labels_full = torch.cat([torch.full((B, Tp), -100, device=device_llm, dtype=input_ids.dtype),
-                                        input_ids], dim=1)
+                labels_full = torch.cat([
+                    torch.full((prefix.size(0), prefix.size(1)), -100, device=device_llm, dtype=input_ids.dtype),
+                    input_ids
+                ], dim=1)
 
-                out = llm_model(inputs_embeds=inputs_embeds,
-                                attention_mask=attn_full,
-                                labels=labels_full)
+                out = llm_model(inputs_embeds=inputs_embeds, attention_mask=attn_full, labels=labels_full)
                 llm_loss = out.loss
-                loss_val = loss_val + alpha_llm * llm_loss.to(device)  # メインのdeviceへ乗せて合算
+                loss_val = loss_val + alpha_llm * llm_loss.to(device)  # ここだけメインdeviceへ足し戻す
 
             tloss_val = float(loss_val.item())
         
@@ -254,8 +298,9 @@ class HTRTrainer(nn.Module):
             if config.arch.head_type == 'both':
                 o = o[0]
             
-            tdecs = o.argmax(2).permute(1, 0).cpu().numpy().squeeze()
-
+            tdecs = o.argmax(2).permute(1, 0).cpu().numpy()
+            if tdecs.ndim == 1:            # バッチサイズが1でも (1, T) にする
+                tdecs = tdecs[None, :]
             for tdec, transcr in zip(tdecs, transcrs):
                 transcr = transcr.strip()
                 dec_transcr = self.decode(tdec, self.classes['i2c']).strip()
@@ -292,6 +337,8 @@ def parse_args():
 
 
 if __name__ == '__main__':
+    
+    from model_llm import llm_model, llm_tokenizer, llm_hidden_size
     # ----------------------- initialize configuration ----------------------- #
     config = parse_args()
     max_epochs = config.train.num_epochs
@@ -306,14 +353,17 @@ if __name__ == '__main__':
         htr_trainer.train(epoch)
         htr_trainer.scheduler.step()
 
+        if epoch == 1:
+            htr_trainer.save(epoch)
+
+
         # save and evaluate the current model
         if epoch % config.train.save_every_k_epochs == 0:
             htr_trainer.save(epoch)
             htr_trainer.test(epoch, 'val')
             htr_trainer.test(epoch, 'test')
 
-    # save the final model
     if not os.path.exists(config.model.save_dir):
-        os.makedirs(config.model.save_dir)
+            os.makedirs(config.model.save_dir)
     torch.save(htr_trainer.net.cpu().state_dict(), config.model.save_dir + '/{}'.format(config.save))
-    
+        
