@@ -73,7 +73,18 @@ class HTREval(nn.Module):
         if config.resume is not None:
             print('resuming from checkpoint: {}'.format(config.resume))
             load_dict = torch.load(config.resume)
-            load_status = net.load_state_dict(load_dict, strict=True)
+
+
+            ckpt = torch.load(config.resume, map_location='cpu')
+            sd = ckpt.get('state_dict', ckpt)
+
+            # 形状不一致の connector を全部削除
+            for k in list(sd.keys()):
+                if k.startswith('top.connector.') or k.startswith('module.top.connector.'):
+                    del sd[k]
+            load_status = net.load_state_dict(sd, strict=False)
+
+
             print(load_status)
         net.to(device)
 

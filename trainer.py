@@ -21,11 +21,14 @@ from models import Connector1D
 
 
 class HTRTrainer(nn.Module):
-    def __init__(self, config,htr_model=None,llm_model=None,llm_tokenizer=None,):
+    def __init__(self, config):
         super().__init__()
         self.config = config
-
-
+        
+        # ★ LLM情報を初期化時に一度だけ取得
+        self.device_llm = next(llm_model.parameters()).device
+        self.lm_dtype = next(llm_model.parameters()).dtype
+        
         self.prepare_dataloaders()
         self.prepare_net()
         self.prepare_losses()
@@ -78,6 +81,9 @@ class HTRTrainer(nn.Module):
             'c2i': cdict,
             'i2c': icdict
         }
+        print('[DEBUG] N_train =', len(train_set))
+        print('[DEBUG] train.batch_size (cfg) =', config.train.batch_size)  
+        print('[DEBUG] steps_per_epoch (len(loader)) =', len(train_loader))
 
     def prepare_net(self):
 
@@ -115,19 +121,13 @@ class HTRTrainer(nn.Module):
     
     
     def ctc_loss_safe(self, logp, labels, act_lens, label_lens):
-        """
-        logp: (T,N,C) on CUDA
-        labels/act_lens/label_lens: CPU 上の long/int64
-        """
+        """cuDNN無効化を削除"""
         crit = nn.CTCLoss(blank=0, reduction='sum', zero_infinity=True)
         try:
-            # このブロックの間だけ cuDNN を切る（native CUDA 実装にフォールバック）
-            with torch.backends.cudnn.flags(enabled=False):
-                return crit(logp, labels, act_lens, label_lens) / self.config.train.batch_size
+            # ★ cuDNN無効化を削除 → 高速化！
+            return crit(logp, labels, act_lens, label_lens) / self.config.train.batch_size
         except RuntimeError:
-            # それでもダメなら CPU で計算（最終落下傘）
             return crit(logp.cpu(), labels, act_lens, label_lens) / self.config.train.batch_size
-        
 
     def prepare_optimizers(self):
         config = self.config
@@ -178,6 +178,9 @@ class HTRTrainer(nn.Module):
     def train(self, epoch):
 
         alpha_llm = getattr(self.config.train, 'alpha_llm', 0.1)
+        # 追加：LLM間引きの間隔（kステップに1回）
+        k = int(getattr(self.config.train, 'llm_interval', 8))
+        
         config = self.config
         device = config.device
 
@@ -227,39 +230,44 @@ class HTRTrainer(nn.Module):
 
 
             llm_loss = torch.tensor(0.0, device=device)  # 表示用
-            if (config.arch.head_type == "both") and (self.net.top.llm_prefix is not None) and (alpha_llm > 0):
+            # ---- LLM 間引き：kステップに1回だけ実行 ----
+            use_llm = (alpha_llm > 0) and ((iter_idx % k) == 0)
+            
+            if use_llm and (config.arch.head_type == "both") and (self.net.top.llm_prefix is not None):
                 # B, Tp, D (Connectorは device 上)
                 # LLM の dtype/device を取得
-                device_llm = next(llm_model.parameters()).device
-                lm_dtype   = next(llm_model.parameters()).dtype
+                # device_llm = next(llm_model.parameters()).device  # 削除
+                # lm_dtype = next(llm_model.parameters()).dtype      # 削除
 
                 # prefix は Connector から来る（通常 float32）。LLM に合わせる！
-                prefix = self.net.top.llm_prefix.to(device_llm, dtype=lm_dtype)  # (B, Tp, d_llm)
+
+
+                prefix = self.net.top.llm_prefix.to(self.device_llm, dtype=self.lm_dtype)  # (B, Tp, d_llm)
 
                 # トークナイズ → ids/mask を LLM デバイスへ
                 tok = llm_tokenizer(list(transcr), return_tensors='pt', padding=True, add_special_tokens=True)
-                input_ids = tok['input_ids'].to(device_llm)
-                attn      = tok['attention_mask'].to(device_llm)
+                input_ids = tok['input_ids'].to(self.device_llm)
+                attn      = tok['attention_mask'].to(self.device_llm)
 
                 # 埋め込みは LLM と同じ dtype/device で返る想定
                 tok_emb = llm_model.get_input_embeddings()(input_ids)            # (B, L, d_llm)
 
                 # 連結時点で dtype/device が揃っている状態にする
                 inputs_embeds = torch.cat([prefix, tok_emb], dim=1)              # (B, Tp+L, d_llm)
-                attn_prefix   = torch.ones(prefix.size(0), prefix.size(1), dtype=attn.dtype, device=device_llm)
+                attn_prefix   = torch.ones(prefix.size(0), prefix.size(1), dtype=attn.dtype, device=self.device_llm)
                 attn_full     = torch.cat([attn_prefix, attn], dim=1)
 
                 labels_full = torch.full_like(input_ids, fill_value=-100)
                 labels_full = torch.cat([
-                    torch.full((prefix.size(0), prefix.size(1)), -100, device=device_llm, dtype=input_ids.dtype),
+                    torch.full((prefix.size(0), prefix.size(1)), -100, device=self.device_llm, dtype=input_ids.dtype),
                     input_ids
                 ], dim=1)
 
                 out = llm_model(inputs_embeds=inputs_embeds, attention_mask=attn_full, labels=labels_full)
                 llm_loss = out.loss
-                loss_val = loss_val + alpha_llm * llm_loss.to(device)  # ここだけメインdeviceへ足し戻す
-
+                loss_val = loss_val + (alpha_llm * k) * llm_loss.to(device)
             tloss_val = float(loss_val.item())
+            
         
             loss_val.backward()
             self.optimizer.step()    
@@ -366,4 +374,3 @@ if __name__ == '__main__':
     if not os.path.exists(config.model.save_dir):
             os.makedirs(config.model.save_dir)
     torch.save(htr_trainer.net.cpu().state_dict(), config.model.save_dir + '/{}'.format(config.save))
-        
