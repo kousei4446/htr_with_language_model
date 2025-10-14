@@ -113,7 +113,7 @@ class HTRTrainer(nn.Module):
                     d_llm=llm_hidden_size
                 )
             # Connector は LLM と同じデバイスに置く（LLM損失の勾配はConnectorだけに流す）
-            net.top.connector.to(device)
+            net.top.connector.to(self.device_llm)
         self.net = net
 
     def prepare_losses(self):
