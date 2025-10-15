@@ -16,9 +16,13 @@ from utils.transforms import aug_transforms
 import torch.nn.functional as F
 
 from utils.metrics import CER, WER
+from utils.stage_monitor import StageMonitor
 
 from models import Connector1D
 
+from utils.tb_logger import TBLogger
+
+# trainer.py 冒頭（import 群の直後あたり）
 
 class HTRTrainer(nn.Module):
     def __init__(self, config):
@@ -33,6 +37,21 @@ class HTRTrainer(nn.Module):
         self.prepare_net()
         self.prepare_losses()
         self.prepare_optimizers()
+        self.stage_monitor = StageMonitor(
+            ema_decay=getattr(config.train, 'ema_decay', 0.97),
+            hold_epochs=getattr(config.train, 'hold_epochs', 1),
+            ratio_band=getattr(config.train, 'ratio_band', (0.2, 0.8)),
+            grad_band=getattr(config.train, 'grad_band', (1e-5, 1e-2)),
+            dep_ratio_stage12=getattr(config.train, 'dep12', 1.5),
+            dep_ratio_stage23=getattr(config.train, 'dep23', 3.0),
+            passes_needed=getattr(config.train, 'passes_needed', 2),
+        )
+        self.tb = TBLogger(
+            log_dir=getattr(self.config.train, 'log_dir', 'runs/htr'),
+            enabled=getattr(self.config.train, 'use_tensorboard', True),
+            rank=0
+        )
+
 
 
     def prepare_dataloaders(self):
@@ -45,13 +64,13 @@ class HTRTrainer(nn.Module):
 
         train_set = HTRDataset(dataset_folder, 'train', fixed_size=fixed_size, transforms=aug_transforms)
         classes = train_set.character_classes
-        print('# training lines ' + str(train_set.__len__()))
+        # print('# training lines ' + str(train_set.__len__()))
 
         val_set = HTRDataset(dataset_folder, 'val', fixed_size=fixed_size, transforms=None)
-        print('# validation lines ' + str(val_set.__len__()))
+        # print('# validation lines ' + str(val_set.__len__()))
 
         test_set = HTRDataset(dataset_folder, 'test', fixed_size=fixed_size, transforms=None)
-        print('# testing lines ' + str(test_set.__len__()))
+        # print('# testing lines ' + str(test_set.__len__()))
 
         # augmentation using data sampler
         train_loader = DataLoader(train_set, batch_size=config.train.batch_size, 
@@ -81,9 +100,9 @@ class HTRTrainer(nn.Module):
             'c2i': cdict,
             'i2c': icdict
         }
-        print('[DEBUG] N_train =', len(train_set))
-        print('[DEBUG] train.batch_size (cfg) =', config.train.batch_size)  
-        print('[DEBUG] steps_per_epoch (len(loader)) =', len(train_loader))
+        # print('[DEBUG] N_train =', len(train_set))
+        # print('[DEBUG] train.batch_size (cfg) =', config.train.batch_size)  
+        # print('[DEBUG] steps_per_epoch (len(loader)) =', len(train_loader))
 
     def prepare_net(self):
 
@@ -91,8 +110,8 @@ class HTRTrainer(nn.Module):
 
         device = config.device
 
-        print('Preparing Net - Architectural elements:')
-        print(config.arch)
+        # print('Preparing Net - Architectural elements:')
+        # print(config.arch)
 
         classes = self.classes['classes']
 
@@ -174,6 +193,134 @@ class HTRTrainer(nn.Module):
         print('orig:: ' + transcr.strip())
         print('pred:: ' + dec_transcr.strip())
 
+    def build_stage_settings(self):
+        """
+        ステージ切替えの閾値は必要最小限：epoch で分岐にします。
+        - 例: 0〜2: Stage1, 3〜5: Stage2, 6〜: Stage3
+        必要なら config.train.stage2_start_epoch / stage3_start_epoch を作って使ってください。
+        """
+        s = self.stage_monitor.stage
+
+        if s == 1:
+            return {'stage': 1, 'spanmask_p': 0.6, 'worddrop_p': 0.3, 'force_mask_k': 4}
+        elif s == 2:
+            return {'stage': 2, 'spanmask_p': 0.8, 'worddrop_p': 0.3, 'force_mask_k': 6}
+        else:
+            return {'stage': 3, 'spanmask_p': 1.0, 'worddrop_p': 1.0, 'force_mask_k': 9999}  # 完全に消すイメージ
+            # ※ Stage3 は後述の compose でゼロ埋めにしてリーク遮断します
+
+
+    def make_spanmask_worddrop(self, B, L, spanmask_p=0.6, worddrop_p=0.3, force_mask_k=4, device='cpu'):
+        """
+        戻り値: keep_mask (B, L) bool
+        True=そのトークンの埋め込みを可視(使う)、False=隠す(ゼロ埋め等)
+        - SpanMask: 連続区間をまとめて隠す
+        - WordDrop: 個別にランダムで隠す
+        - 先頭Kトークンは必ずマスク (prefix 依存を強制)
+        # 例: L=10, spanmask_p=0.6, worddrop_p=0.3, force_mask_k=2
+        original:  [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]  # 全てTrue
+        force_mask:[0, 0, 1, 1, 1, 1, 1, 1, 1, 1]  # 先頭2つマスク
+        spanmask:  [0, 0, 0, 0, 0, 1, 1, 1, 1, 1]  # 連続区間マスク
+        worddrop:  [0, 0, 0, 0, 0, 1, 0, 1, 1, 0]  # 個別ドロップ
+        final:     [0, 0, 0, 0, 0, 1, 0, 1, 1, 0]  # 最終結果
+        """
+        keep = torch.ones(B, L, dtype=torch.bool, device=device)
+
+        # 先頭K は必ず隠す
+        K = min(force_mask_k, L)
+        if K > 0:
+            keep[:, :K] = False
+
+        # SpanMask: 目標マスク率に近づくまでランダムに区間を消す
+        target_mask = int(L * spanmask_p)
+        for b in range(B):
+            masked = (~keep[b]).sum().item()
+            # span の平均長（適当な実用値）
+            mean_span = max(3, L // 10)
+            # 過剰に回さない
+            tries = 0
+            while masked < target_mask and tries < 50:
+                span = max(1, int(torch.normal(mean_span, mean_span*0.5).abs().item()))
+                start = torch.randint(0, max(1, L - span + 1), (1,)).item()
+                keep[b, start:start+span] = False
+                masked = (~keep[b]).sum().item()
+                tries += 1
+
+        # WordDrop: 残りの可視トークンにも個別ドロップ
+        drop = torch.rand(B, L, device=device) < worddrop_p
+        keep = keep & (~drop)
+
+        # 先頭Kは二重保障で必ず False
+        if K > 0:
+            keep[:, :K] = False
+
+        # 極端に全部Falseだと学習不安定なので「最低1つはTrue」を保証
+        for b in range(B):
+            if not keep[b].any():
+                keep[b, torch.randint(0, L, (1,)).item()] = True
+
+        return keep  # bool(B,L)
+
+
+    def compose_llm_inputs(self, prefix, input_ids, stage_cfg):
+        """
+        - prefix: (B, Tp, d_llm)
+        - input_ids: (B, L)
+        戻り値: inputs_embeds (B, Tp+L, d_llm), attn_full (B, Tp+L), labels_full (B, Tp+L)
+        ルール:
+        Stage1/2:
+            - 可視トークンは埋め込みを使う
+            - マスクされたトークンはゼロ埋めベクトルに置換
+        Stage3:
+            - テキスト部分は全ゼロ埋め（Prefix-only 相当）
+        共通:
+            - prefix 部分の labels は -100
+            - テキスト部分の labels は input_ids（HFが内部で1トークン右にずらす）
+        """
+        B, Tp, D = prefix.shape
+        tok = llm_tokenizer.pad_token_id if llm_tokenizer.pad_token_id is not None else llm_tokenizer.eos_token_id
+        # 埋め込みを一括で取得（LLMデバイス/精度）
+        tok_emb = llm_model.get_input_embeddings()(input_ids.to(self.device_llm))   # (B, L, D)
+
+        # Stageごとの可視マスク
+        if stage_cfg['stage'] == 1:
+            keep = self.make_spanmask_worddrop(
+                B, input_ids.size(1),
+                spanmask_p=stage_cfg['spanmask_p'],
+                worddrop_p=stage_cfg['worddrop_p'],
+                force_mask_k=stage_cfg['force_mask_k'],
+                device=self.device_llm
+            )
+        elif stage_cfg['stage'] == 2:
+            keep = self.make_spanmask_worddrop(
+                B, input_ids.size(1),
+                spanmask_p=stage_cfg['spanmask_p'],
+                worddrop_p=stage_cfg['worddrop_p'],
+                force_mask_k=stage_cfg['force_mask_k'],
+                device=self.device_llm
+            )
+        else:
+            # Stage3: テキスト全部マスク扱い
+            keep = torch.zeros(B, input_ids.size(1), dtype=torch.bool, device=self.device_llm)
+
+        # マスクされた位置はゼロ埋めベクトルに置換（リーク遮断）
+        zero_vec = torch.zeros(1, 1, D, device=self.device_llm, dtype=tok_emb.dtype)
+        masked_tok_emb = torch.where(
+            keep.unsqueeze(-1), tok_emb, zero_vec.expand(B, input_ids.size(1), D)
+        )
+
+        # inputs_embeds = [prefix, masked_tok_emb]
+        inputs_embeds = torch.cat([prefix.to(self.device_llm, dtype=tok_emb.dtype), masked_tok_emb], dim=1)
+
+        # attention は全部1で OK（ゼロ埋め位置にも attend 可能：学習しやすい）
+        attn_full = torch.ones(B, Tp + input_ids.size(1), dtype=torch.long, device=self.device_llm)
+
+        # labels: prefix 部分は ignore(-100)、テキスト部分は元の input_ids
+        labels_full = torch.full((B, Tp, ), fill_value=-100, device=self.device_llm, dtype=input_ids.dtype)
+        labels_full = torch.cat([labels_full, input_ids.to(self.device_llm)], dim=1)
+
+        return inputs_embeds, attn_full, labels_full
+
 
     def train(self, epoch):
 
@@ -223,7 +370,8 @@ class HTRTrainer(nn.Module):
             # ★ cuDNN を避ける“安全CTC”を使用
             loss_val = self.ctc_loss_safe(logp, labels, act_lens, label_lens)
 
-
+            ctc_only = loss_val.clone()
+            
             if config.arch.head_type == "both":
                 loss_val += 0.1 * self.ctc_loss(aux_output, labels, act_lens, label_lens)
 
@@ -249,27 +397,50 @@ class HTRTrainer(nn.Module):
                 input_ids = tok['input_ids'].to(self.device_llm)
                 attn      = tok['attention_mask'].to(self.device_llm)
 
-                # 埋め込みは LLM と同じ dtype/device で返る想定
-                tok_emb = llm_model.get_input_embeddings()(input_ids)            # (B, L, d_llm)
-
-                # 連結時点で dtype/device が揃っている状態にする
-                inputs_embeds = torch.cat([prefix, tok_emb], dim=1)              # (B, Tp+L, d_llm)
-                attn_prefix   = torch.ones(prefix.size(0), prefix.size(1), dtype=attn.dtype, device=self.device_llm)
-                attn_full     = torch.cat([attn_prefix, attn], dim=1)
-
-                labels_full = torch.full_like(input_ids, fill_value=-100)
-                labels_full = torch.cat([
-                    torch.full((prefix.size(0), prefix.size(1)), -100, device=self.device_llm, dtype=input_ids.dtype),
-                    input_ids
-                ], dim=1)
-
+                # Stageごとの設定を取得
+                stage_cfg = self.build_stage_settings()
+                                
+                # LLM入力を合成
+                inputs_embeds, attn_full, labels_full = self.compose_llm_inputs(
+                    prefix, input_ids, stage_cfg
+                )
                 out = llm_model(inputs_embeds=inputs_embeds, attention_mask=attn_full, labels=labels_full)
                 llm_loss = out.loss
+  
                 loss_val = loss_val + (alpha_llm * k) * llm_loss.to(device)
+                
             tloss_val = float(loss_val.item())
             
         
             loss_val.backward()
+            self.tb.log_train_step(
+                ctc_only=float(ctc_only.item()),
+                llm_loss=float(llm_loss.item()),
+                total=float(loss_val.item()),
+                stage=self.stage_monitor.stage,
+                ratio_ema=self.stage_monitor.ratio_ema,
+                grad_ema=self.stage_monitor.grad_ema
+            )
+
+            conn_grad = None
+            if hasattr(self.net.top, 'connector') and (self.net.top.connector is not None):
+                s, n = 0.0, 0
+                for p in self.net.top.connector.parameters():
+                    if p.grad is not None:
+                        s += p.grad.detach().abs().mean().item(); n += 1
+                conn_grad = (s / n) if n > 0 else None
+
+            llm_loss_val = float(llm_loss.item())
+
+            
+            self.stage_monitor.update_batch(
+                ctc_loss=float(ctc_only.item()),
+                llm_loss=llm_loss_val,
+                connector_grad_mean=conn_grad,
+                alpha_llm=alpha_llm,
+                k=k
+            )
+
             self.optimizer.step()    
 
             if config.arch.head_type == "both" and alpha_llm > 0:
@@ -279,7 +450,44 @@ class HTRTrainer(nn.Module):
                 t.set_postfix(values='loss : {:.2f}'.format(tloss_val))
 
         self.sample_decoding()
+        dep_ratio = self.dependency_test_small(tset='val', max_B=4)
+        self.stage_monitor.on_eval_dependency(dep_ratio, cer=None, wer=None)
+        new_stage, changed = self.stage_monitor.maybe_advance(epoch)
+        self.tb.log_dep_ratio(epoch, dep_ratio)
+        if changed:
+            print(f"[StageMonitor] Stage advanced to {new_stage} at epoch {epoch}")
+        
     
+    @torch.no_grad()
+    def dependency_test_small(self, tset='val', max_B=4):
+        device = self.config.device
+        loader = self.loaders['val'] if tset=='val' else self.loaders['test']
+        imgs, transcrs = next(iter(loader))
+        imgs = imgs[:max_B].to(device)
+        transcrs = transcrs[:max_B]
+
+        self.net.eval()
+        o = self.net(imgs)
+        if self.config.arch.head_type == 'both':
+            _ = o[0]  # llm_prefix を更新するために forward だけ
+        prefix = self.net.top.llm_prefix.to(self.device_llm, dtype=self.lm_dtype)
+
+        tok = llm_tokenizer(list(transcrs), return_tensors='pt', padding=True, add_special_tokens=True)
+        input_ids = tok['input_ids'].to(self.device_llm)
+
+        stage_cfg = self.build_stage_settings()
+        inputs_embeds, attn_full, labels_full = self.compose_llm_inputs(prefix, input_ids, stage_cfg)
+        out = llm_model(inputs_embeds=inputs_embeds, attention_mask=attn_full, labels=labels_full)
+        L_base = float(out.loss.item())
+
+        zeros = torch.zeros_like(prefix)
+        inputs_embeds_np = torch.cat([zeros, inputs_embeds[:, prefix.size(1):]], dim=1)
+        out_np = llm_model(inputs_embeds=inputs_embeds_np, attention_mask=attn_full, labels=labels_full)
+        L_noprefix = float(out_np.loss.item())
+
+        self.net.train()
+        return L_noprefix / max(L_base, 1e-8)
+
     def test(self, epoch, tset='test'):
 
         config = self.config
@@ -323,6 +531,8 @@ class HTRTrainer(nn.Module):
         print('WER at epoch {}: {:.3f}'.format(epoch, wer_score))
 
         self.net.train()
+        self.tb.log_eval(epoch, cer=cer_score, wer=wer_score, split=tset)
+        
 
     def save(self, epoch):
         print('####################### Saving model at epoch {} #######################'.format(epoch))
@@ -370,7 +580,10 @@ if __name__ == '__main__':
             htr_trainer.save(epoch)
             htr_trainer.test(epoch, 'val')
             htr_trainer.test(epoch, 'test')
-
+            
+            
+    
     if not os.path.exists(config.model.save_dir):
             os.makedirs(config.model.save_dir)
     torch.save(htr_trainer.net.cpu().state_dict(), config.model.save_dir + '/{}'.format(config.save))
+    htr_trainer.tb.close()

@@ -31,6 +31,8 @@ train:
   save_every_k_epochs: 50
   num_workers: 8
   llm_interval: 8     # ← LLMを間引く間隔（8ステップに1回）
+  log_dir: runs/htr
+  use_tensorboard: true
 
 # evaluation
 eval:

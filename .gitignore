@@ -4,3 +4,5 @@
 *.pyc
 *.pt
 /def_htrnet
+
+/check
