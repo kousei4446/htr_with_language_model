@@ -29,7 +29,7 @@ train:
   batch_size: 8
   scheduler: 'mstep'  # right now only 'mstep' is supported, i.e. multistep
   save_every_k_epochs: 50
-  num_workers: 8
+  num_workers: 0      # ★ LLMモデルの多重ロード防止のため0に設定
   llm_interval: 8     # ← LLMを間引く間隔（8ステップに1回）
   log_dir: runs/htr
   use_tensorboard: true
@@ -37,7 +37,7 @@ train:
 # evaluation
 eval:
   batch_size: 8
-  num_workers: 8
+  num_workers: 0      # ★ LLMモデルの多重ロード防止のため0に設定
   wer_mode: 'tokenizer' # select from 'tokenizer', 'space'
 
 

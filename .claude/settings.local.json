@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir C:UsersuseraiHTR-best-practices)",
+      "Bash(python:*)",
+      "Bash(timeout 120 python:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

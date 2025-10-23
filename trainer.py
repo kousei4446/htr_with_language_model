@@ -22,7 +22,8 @@ from models import Connector1D
 
 from utils.tb_logger import TBLogger
 
-# trainer.py 冒頭（import 群の直後あたり）
+# LLMモデルのインポート（グローバルスコープで必須）
+from model_llm import llm_model, llm_tokenizer, llm_hidden_size
 
 class HTRTrainer(nn.Module):
     def __init__(self, config):
@@ -123,16 +124,27 @@ class HTRTrainer(nn.Module):
             load_status = net.load_state_dict(load_dict, strict=True)
             print(load_status)
         net.to(device)
-        # ★ CTCtopB かつ Connector 有効なら LLM次元に合わせて差し替え＆デバイス移動
-        if hasattr(net.top, 'connector') and (net.top.connector is not None):
-            # d_llm を LLM の hidden_size に合わせ直す
-            if net.top.connector.ln.normalized_shape[0] != llm_hidden_size:
-                net.top.connector = Connector1D(
-                    d_in=net.top.connector.proj.in_features,
-                    d_llm=llm_hidden_size
+        # ★ CTCtopB かつ Connector×2 有効なら LLM次元に合わせて差し替え＆デバイス移動
+        if hasattr(net.top, 'connector1') and (net.top.connector1 is not None):
+            # Connector1 (CNN末)
+            if net.top.connector1.ln.normalized_shape[0] != llm_hidden_size:
+                net.top.connector1 = Connector1D(
+                    d_in=net.top.connector1.proj.in_features,
+                    d_llm=llm_hidden_size,
+                    ds_factor=1
                 )
-            # Connector は LLM と同じデバイスに置く（LLM損失の勾配はConnectorだけに流す）
-            net.top.connector.to(self.device_llm)
+            net.top.connector1.to(self.device_llm)
+
+        if hasattr(net.top, 'connector2') and (net.top.connector2 is not None):
+            # Connector2 (RNN中段)
+            if net.top.connector2.ln.normalized_shape[0] != llm_hidden_size:
+                net.top.connector2 = Connector1D(
+                    d_in=net.top.connector2.proj.in_features,
+                    d_llm=llm_hidden_size,
+                    ds_factor=1
+                )
+            net.top.connector2.to(self.device_llm)
+
         self.net = net
 
     def prepare_losses(self):
@@ -240,7 +252,7 @@ class HTRTrainer(nn.Module):
             # 過剰に回さない
             tries = 0
             while masked < target_mask and tries < 50:
-                span = max(1, int(torch.normal(mean_span, mean_span*0.5).abs().item()))
+                span = max(1, int(torch.normal(float(mean_span), float(mean_span*0.5), size=(1,)).abs().item()))
                 start = torch.randint(0, max(1, L - span + 1), (1,)).item()
                 keep[b, start:start+span] = False
                 masked = (~keep[b]).sum().item()
@@ -261,6 +273,39 @@ class HTRTrainer(nn.Module):
 
         return keep  # bool(B,L)
 
+
+    def lail_loss(self, prefix1, prefix2, input_ids, stage_cfg):
+        """
+        LAIL損失: CE + 0.3·KL(T=2.5)
+        - prefix1: CNN末からのprefix (B, Tp, d_llm)
+        - prefix2: RNN中段からのprefix (B, Tp, d_llm)
+        - 両方でLLM forwardし、CE損失の平均 + KL divergenceを計算
+        """
+        # prefix1でLLM forward
+        inputs_embeds1, attn1, labels1 = self.compose_llm_inputs(prefix1, input_ids, stage_cfg)
+        out1 = llm_model(inputs_embeds=inputs_embeds1, attention_mask=attn1, labels=labels1)
+
+        # prefix2でLLM forward
+        inputs_embeds2, attn2, labels2 = self.compose_llm_inputs(prefix2, input_ids, stage_cfg)
+        out2 = llm_model(inputs_embeds=inputs_embeds2, attention_mask=attn2, labels=labels2)
+
+        # CE損失（平均）
+        ce_loss = (out1.loss + out2.loss) / 2.0
+
+        # KL損失（温度T=2.5）
+        T = 2.5
+        logits1 = out1.logits  # (B, L, vocab_size)
+        logits2 = out2.logits
+
+        # 温度スケーリングしてKL divergence計算
+        p1 = F.softmax(logits1 / T, dim=-1)
+        log_p2 = F.log_softmax(logits2 / T, dim=-1)
+
+        # KL(p1 || p2) を計算（prefix部分は無視するためlabels=-100の位置をマスク）
+        # 簡易版: 全体でKLを計算（厳密にはlabels!=-100の位置のみ）
+        kl_loss = F.kl_div(log_p2, p1, reduction='batchmean') * (T ** 2)  # 温度補正
+
+        return ce_loss + 0.3 * kl_loss, float(ce_loss.item()), float(kl_loss.item())
 
     def compose_llm_inputs(self, prefix, input_ids, stage_cfg):
         """
@@ -327,7 +372,10 @@ class HTRTrainer(nn.Module):
         alpha_llm = getattr(self.config.train, 'alpha_llm', 0.1)
         # 追加：LLM間引きの間隔（kステップに1回）
         k = int(getattr(self.config.train, 'llm_interval', 8))
-        
+
+        # ★ LLM間引き確認ログ
+        print(f"[LLM Interval] LLM損失は {k} ステップに1回計算されます (alpha_llm={alpha_llm})")
+
         config = self.config
         device = config.device
 
@@ -378,35 +426,28 @@ class HTRTrainer(nn.Module):
 
 
             llm_loss = torch.tensor(0.0, device=device)  # 表示用
+            ce_loss_val = 0.0
+            kl_loss_val = 0.0
+
             # ---- LLM 間引き：kステップに1回だけ実行 ----
             use_llm = (alpha_llm > 0) and ((iter_idx % k) == 0)
-            
-            if use_llm and (config.arch.head_type == "both") and (self.net.top.llm_prefix is not None):
-                # B, Tp, D (Connectorは device 上)
-                # LLM の dtype/device を取得
-                # device_llm = next(llm_model.parameters()).device  # 削除
-                # lm_dtype = next(llm_model.parameters()).dtype      # 削除
 
-                # prefix は Connector から来る（通常 float32）。LLM に合わせる！
+            if use_llm and (config.arch.head_type == "both") and \
+               (self.net.top.llm_prefix1 is not None) and (self.net.top.llm_prefix2 is not None):
+                # ★ Connector×2からprefix1とprefix2を取得
+                prefix1 = self.net.top.llm_prefix1.to(self.device_llm, dtype=self.lm_dtype)
+                prefix2 = self.net.top.llm_prefix2.to(self.device_llm, dtype=self.lm_dtype)
 
-
-                prefix = self.net.top.llm_prefix.to(self.device_llm, dtype=self.lm_dtype)  # (B, Tp, d_llm)
-
-                # トークナイズ → ids/mask を LLM デバイスへ
+                # トークナイズ → ids を LLM デバイスへ
                 tok = llm_tokenizer(list(transcr), return_tensors='pt', padding=True, add_special_tokens=True)
                 input_ids = tok['input_ids'].to(self.device_llm)
-                attn      = tok['attention_mask'].to(self.device_llm)
 
                 # Stageごとの設定を取得
                 stage_cfg = self.build_stage_settings()
-                                
-                # LLM入力を合成
-                inputs_embeds, attn_full, labels_full = self.compose_llm_inputs(
-                    prefix, input_ids, stage_cfg
-                )
-                out = llm_model(inputs_embeds=inputs_embeds, attention_mask=attn_full, labels=labels_full)
-                llm_loss = out.loss
-  
+
+                # ★ LAIL損失を計算（CE + 0.3·KL）
+                llm_loss, ce_loss_val, kl_loss_val = self.lail_loss(prefix1, prefix2, input_ids, stage_cfg)
+
                 loss_val = loss_val + (alpha_llm * k) * llm_loss.to(device)
                 
             tloss_val = float(loss_val.item())
@@ -419,16 +460,23 @@ class HTRTrainer(nn.Module):
                 total=float(loss_val.item()),
                 stage=self.stage_monitor.stage,
                 ratio_ema=self.stage_monitor.ratio_ema,
-                grad_ema=self.stage_monitor.grad_ema
+                grad_ema=self.stage_monitor.grad_ema,
+                ce_loss=ce_loss_val,
+                kl_loss=kl_loss_val
             )
 
+            # ★ Connector×2の勾配を計算
             conn_grad = None
-            if hasattr(self.net.top, 'connector') and (self.net.top.connector is not None):
-                s, n = 0.0, 0
-                for p in self.net.top.connector.parameters():
+            s, n = 0.0, 0
+            if hasattr(self.net.top, 'connector1') and (self.net.top.connector1 is not None):
+                for p in self.net.top.connector1.parameters():
                     if p.grad is not None:
                         s += p.grad.detach().abs().mean().item(); n += 1
-                conn_grad = (s / n) if n > 0 else None
+            if hasattr(self.net.top, 'connector2') and (self.net.top.connector2 is not None):
+                for p in self.net.top.connector2.parameters():
+                    if p.grad is not None:
+                        s += p.grad.detach().abs().mean().item(); n += 1
+            conn_grad = (s / n) if n > 0 else None
 
             llm_loss_val = float(llm_loss.item())
 
@@ -441,17 +489,31 @@ class HTRTrainer(nn.Module):
                 k=k
             )
 
-            self.optimizer.step()    
+            self.optimizer.step()
 
+            # ★ tqdm表示更新（LLM間引きを考慮）
             if config.arch.head_type == "both" and alpha_llm > 0:
-                t.set_postfix_str('loss: {:.2f} | llm: {:.2f}'.format(tloss_val, float(llm_loss.item())))
+                if use_llm and (iter_idx % k) == 0:
+                    # LLM計算したステップ: CE/KL損失も表示
+                    t.set_postfix_str('loss: {:.2f} | llm: {:.2f} (CE: {:.2f}, KL: {:.2f}) [LLM@{}/{}]'.format(
+                        tloss_val, float(llm_loss.item()), ce_loss_val, kl_loss_val, iter_idx, k))
+                else:
+                    # LLM計算しないステップ
+                    t.set_postfix_str('loss: {:.2f} | llm: skip'.format(tloss_val))
             else:
                 t.set_postfix_str('loss: {:.2f}'.format(tloss_val))
-                t.set_postfix(values='loss : {:.2f}'.format(tloss_val))
 
         self.sample_decoding()
         dep_ratio = self.dependency_test_small(tset='val', max_B=4)
         self.stage_monitor.on_eval_dependency(dep_ratio, cer=None, wer=None)
+
+        # ★ StageMonitor デバッグログ
+        print(f"\n[StageMonitor Debug] Epoch {epoch}")
+        print(f"  Stage: {self.stage_monitor.stage}, Passes: {self.stage_monitor.passes}/{self.stage_monitor.passes_needed}")
+        print(f"  dep_ratio: {dep_ratio:.3f} (need: {self.stage_monitor.dep12 if self.stage_monitor.stage==1 else self.stage_monitor.dep23})")
+        print(f"  ratio_ema: {self.stage_monitor.ratio_ema:.3f} (band: {self.stage_monitor.ratio_lo:.2f}-{self.stage_monitor.ratio_hi:.2f})")
+        print(f"  grad_ema: {self.stage_monitor.grad_ema:.5f} (band: {self.stage_monitor.grad_lo:.5f}-{self.stage_monitor.grad_hi:.5f})")
+
         new_stage, changed = self.stage_monitor.maybe_advance(epoch)
         self.tb.log_dep_ratio(epoch, dep_ratio)
         if changed:
@@ -469,8 +531,14 @@ class HTRTrainer(nn.Module):
         self.net.eval()
         o = self.net(imgs)
         if self.config.arch.head_type == 'both':
-            _ = o[0]  # llm_prefix を更新するために forward だけ
-        prefix = self.net.top.llm_prefix.to(self.device_llm, dtype=self.lm_dtype)
+            _ = o[0]  # llm_prefix1, llm_prefix2 を更新するために forward だけ
+
+        # ★ Connector2（RNN中段）を使って依存度テスト（より情報量が多い）
+        if hasattr(self.net.top, 'llm_prefix2') and (self.net.top.llm_prefix2 is not None):
+            prefix = self.net.top.llm_prefix2.to(self.device_llm, dtype=self.lm_dtype)
+        else:
+            # フォールバック: prefix1を使う
+            prefix = self.net.top.llm_prefix1.to(self.device_llm, dtype=self.lm_dtype)
 
         tok = llm_tokenizer(list(transcrs), return_tensors='pt', padding=True, add_special_tokens=True)
         input_ids = tok['input_ids'].to(self.device_llm)
@@ -536,10 +604,10 @@ class HTRTrainer(nn.Module):
 
     def save(self, epoch):
         print('####################### Saving model at epoch {} #######################'.format(epoch))
-        if not os.path.exists(config.model.save_dir):
-            os.makedirs(config.model.save_dir)
+        if not os.path.exists(self.config.model.save_dir):
+            os.makedirs(self.config.model.save_dir)
 
-        torch.save(self.net.cpu().state_dict(), config.model.save_dir + '/{}.pt'.format(epoch))
+        torch.save(self.net.cpu().state_dict(), self.config.model.save_dir + '/{}.pt'.format(epoch))
         self.net.to(self.config.device)
 
 
@@ -555,8 +623,6 @@ def parse_args():
 
 
 if __name__ == '__main__':
-    
-    from model_llm import llm_model, llm_tokenizer, llm_hidden_size
     # ----------------------- initialize configuration ----------------------- #
     config = parse_args()
     max_epochs = config.train.num_epochs

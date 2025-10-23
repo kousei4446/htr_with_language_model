@@ -150,39 +150,57 @@ class CTCtopB(nn.Module):
         super(CTCtopB, self).__init__()
 
         hidden, num_layers = rnn_cfg
-        
+
         RNN = nn.GRU if rnn_type == 'gru' else nn.LSTM
-        
+
         self.rec1 = RNN(input_size, hidden, num_layers=1, bidirectional=True, dropout=0.0)
-        
+
         self.recN = None
         if num_layers > 1:
             self.recN = RNN(2*hidden, hidden, num_layers=num_layers-1, bidirectional=True, dropout=.2)
-            
+
         self.fnl = nn.Sequential(nn.Dropout(.5), nn.Linear(2 * hidden, nclasses))
 
-        self.cnn = nn.Sequential(nn.Dropout(.5), 
+        self.cnn = nn.Sequential(nn.Dropout(.5),
                                  nn.Conv2d(input_size, nclasses, kernel_size=(1, 3), stride=1, padding=(0, 1))
         )
-        
-        
-        self.connector = Connector1D(2*hidden, d_llm) if enable_connector else None
-        self.llm_prefix = None  # 学習ループから参照するための置き場
+
+        # ★ Connector×2: CNN末とRNN中段
+        if enable_connector:
+            self.connector1 = Connector1D(input_size, d_llm, ds_factor=1)  # CNN末（長さ維持）
+            self.connector2 = Connector1D(2*hidden, d_llm, ds_factor=1)    # RNN中段
+        else:
+            self.connector1 = None
+            self.connector2 = None
+
+        self.llm_prefix1 = None  # CNN末からのprefix
+        self.llm_prefix2 = None  # RNN中段からのprefix
         
         
     def forward(self, x):
+        # x: (B, C, H, W) - CNN出力
 
-        y = x.permute(2, 3, 0, 1)[0]
-        y1 = self.rec1(y)[0]
-        
-        if (self.connector is not None) and self.training:
-            y1_bt = y1.permute(1, 0, 2).contiguous()   # (B, T, 2H)
-            self.llm_prefix = self.connector(y1_bt)    # (B, T, d_llm)
+        # ★ Connector1: CNN末（RNN前）
+        if (self.connector1 is not None) and self.training:
+            # x: (B, C, H, W) → (B, W, C) でH次元を潰す
+            x_flat = x.squeeze(2) if x.size(2) == 1 else torch.max(x, dim=2)[0]  # (B, C, W)
+            x_bt = x_flat.permute(0, 2, 1).contiguous()  # (B, W, C)
+            self.llm_prefix1 = self.connector1(x_bt)  # (B, W, d_llm)
         else:
-            self.llm_prefix = None
-            
-        y = self.recN(y1)[0]
-        y = self.fnl(y)
+            self.llm_prefix1 = None
+
+        y = x.permute(2, 3, 0, 1)[0]  # (W, B, C)
+        y1 = self.rec1(y)[0]          # (W, B, 2H)
+
+        # ★ Connector2: RNN中段（rec1後）
+        if (self.connector2 is not None) and self.training:
+            y1_bt = y1.permute(1, 0, 2).contiguous()  # (B, W, 2H)
+            self.llm_prefix2 = self.connector2(y1_bt)  # (B, W, d_llm)
+        else:
+            self.llm_prefix2 = None
+
+        y = self.recN(y1)[0]  # (W, B, 2H)
+        y = self.fnl(y)       # (W, B, nclasses)
 
         if self.training:
             return y, self.cnn(x).permute(2, 3, 0, 1)[0]
