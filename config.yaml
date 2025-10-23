@@ -31,6 +31,8 @@ train:
   save_every_k_epochs: 50
   num_workers: 0      # ★ LLMモデルの多重ロード防止のため0に設定
   llm_interval: 8     # ← LLMを間引く間隔（8ステップに1回）
+  alpha_llm: 0.05     # ← LLM損失の重み（0.1→0.05に減らして安定化）
+  llm_warmup_epochs: 2  # ← 最初の2エポックはLLM損失を徐々に増やす
   log_dir: runs/htr
   use_tensorboard: true
 

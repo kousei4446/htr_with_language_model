@@ -292,10 +292,14 @@ class HTRTrainer(nn.Module):
         # CE損失（平均）
         ce_loss = (out1.loss + out2.loss) / 2.0
 
-        # KL損失（温度T=2.5）
+        # KL損失（温度T=2.5）- 数値安定化版
         T = 2.5
         logits1 = out1.logits  # (B, L, vocab_size)
         logits2 = out2.logits
+
+        # ★ 数値安定化: logitsをクリップしてオーバーフローを防ぐ
+        logits1 = torch.clamp(logits1, -100, 100)
+        logits2 = torch.clamp(logits2, -100, 100)
 
         # 温度スケーリングしてKL divergence計算
         p1 = F.softmax(logits1 / T, dim=-1)
@@ -303,7 +307,18 @@ class HTRTrainer(nn.Module):
 
         # KL(p1 || p2) を計算（prefix部分は無視するためlabels=-100の位置をマスク）
         # 簡易版: 全体でKLを計算（厳密にはlabels!=-100の位置のみ）
-        kl_loss = F.kl_div(log_p2, p1, reduction='batchmean') * (T ** 2)  # 温度補正
+        kl_raw = F.kl_div(log_p2, p1, reduction='batchmean') * (T ** 2)  # 温度補正
+
+        # ★ 数値安定化: KL divergenceをクリップ（異常に高い値を防ぐ）
+        kl_loss = torch.clamp(kl_raw, 0.0, 10.0)
+
+        # ★ NaN/Infチェック
+        if not torch.isfinite(ce_loss):
+            print(f"[WARNING] CE loss is not finite: {ce_loss.item()}, setting to 0")
+            ce_loss = torch.tensor(0.0, device=ce_loss.device)
+        if not torch.isfinite(kl_loss):
+            print(f"[WARNING] KL loss is not finite (raw={kl_raw.item()}), setting to 0")
+            kl_loss = torch.tensor(0.0, device=kl_loss.device)
 
         return ce_loss + 0.3 * kl_loss, float(ce_loss.item()), float(kl_loss.item())
 
@@ -369,12 +384,20 @@ class HTRTrainer(nn.Module):
 
     def train(self, epoch):
 
-        alpha_llm = getattr(self.config.train, 'alpha_llm', 0.1)
+        alpha_llm_base = getattr(self.config.train, 'alpha_llm', 0.1)
         # 追加：LLM間引きの間隔（kステップに1回）
         k = int(getattr(self.config.train, 'llm_interval', 8))
 
+        # ★ LLM損失のウォームアップ
+        llm_warmup_epochs = getattr(self.config.train, 'llm_warmup_epochs', 0)
+        if epoch <= llm_warmup_epochs:
+            # ウォームアップ期間中は徐々に増やす
+            alpha_llm = alpha_llm_base * (epoch / max(llm_warmup_epochs, 1))
+        else:
+            alpha_llm = alpha_llm_base
+
         # ★ LLM間引き確認ログ
-        print(f"[LLM Interval] LLM損失は {k} ステップに1回計算されます (alpha_llm={alpha_llm})")
+        print(f"[LLM Interval] LLM損失は {k} ステップに1回計算されます (alpha_llm={alpha_llm:.4f}, base={alpha_llm_base})")
 
         config = self.config
         device = config.device
@@ -408,7 +431,16 @@ class HTRTrainer(nn.Module):
             assert labels.numel() == int(label_lens.sum())
             assert (label_lens > 0).all() and (act_lens > 0).all()
             assert (label_lens <= act_lens).all()
-            assert torch.isfinite(output).all(), "output has NaN/Inf"
+
+            # ★ NaN/Inf検出と詳細ログ
+            if not torch.isfinite(output).all():
+                print(f"\n[ERROR] output has NaN/Inf detected!")
+                print(f"  - output stats: min={output.min().item():.4f}, max={output.max().item():.4f}, mean={output.mean().item():.4f}")
+                print(f"  - NaN count: {torch.isnan(output).sum().item()}")
+                print(f"  - Inf count: {torch.isinf(output).sum().item()}")
+                print(f"  - Skipping this batch to continue training...")
+                continue  # このバッチをスキップして次へ
+
             if labels.numel() > 0:  # 空でなければ値域チェック
                 assert int(labels.min()) >= 0 and int(labels.max()) < C
 
@@ -480,7 +512,7 @@ class HTRTrainer(nn.Module):
 
             llm_loss_val = float(llm_loss.item())
 
-            
+
             self.stage_monitor.update_batch(
                 ctc_loss=float(ctc_only.item()),
                 llm_loss=llm_loss_val,
@@ -488,6 +520,9 @@ class HTRTrainer(nn.Module):
                 alpha_llm=alpha_llm,
                 k=k
             )
+
+            # ★ Gradient clipping を追加（NaN/Inf防止）
+            torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=5.0)
 
             self.optimizer.step()
 
