@@ -484,7 +484,8 @@ class HTRTrainer(nn.Module):
                 # ★ LAIL損失を計算（CE + 0.3·KL）
                 llm_loss, ce_loss_val, kl_loss_val = self.lail_loss(prefix1, prefix2, input_ids, stage_cfg)
 
-                loss_val = loss_val + (alpha_llm * k) * llm_loss.to(device)
+                # ★ 修正: k倍のスケーリングを削除（alpha_llmのみでスケール）
+                loss_val = loss_val + alpha_llm * llm_loss.to(device)
 
                 # ★ LLM計算時間ログ
                 llm_time = time.time() - llm_start
@@ -530,10 +531,36 @@ class HTRTrainer(nn.Module):
                 k=k
             )
 
-            # ★ Gradient clipping を追加（NaN/Inf防止）
-            torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=5.0)
+            # ★ Gradient clipping を追加（NaN/Inf防止）- より厳しく
+            torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=1.0)
 
-            self.optimizer.step()
+            # ★ パラメータのNaN検出（optimizer.step前）
+            has_nan = False
+            for name, param in self.net.named_parameters():
+                if param.grad is not None and not torch.isfinite(param.grad).all():
+                    print(f"[WARNING] Gradient NaN/Inf in {name}, skipping optimizer step")
+                    has_nan = True
+                    break
+
+            if not has_nan:
+                self.optimizer.step()
+            else:
+                # 勾配をゼロにして次のステップへ
+                self.optimizer.zero_grad()
+                print("[WARNING] Skipping optimizer step due to NaN gradients")
+
+            # ★ パラメータ自体のNaN検出（optimizer.step後）
+            for name, param in self.net.named_parameters():
+                if not torch.isfinite(param).all():
+                    print(f"\n[CRITICAL] Parameter {name} has NaN/Inf! Training is corrupted.")
+                    print(f"  Reinitializing {name} to prevent further corruption...")
+                    # パラメータを再初期化
+                    if 'weight' in name:
+                        nn.init.xavier_normal_(param.data)
+                    elif 'bias' in name:
+                        nn.init.zeros_(param.data)
+                    else:
+                        param.data.fill_(0.01)
 
             # ★ tqdm表示更新（LLM間引きを考慮）
             if config.arch.head_type == "both" and alpha_llm > 0:
