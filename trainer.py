@@ -466,6 +466,10 @@ class HTRTrainer(nn.Module):
 
             if use_llm and (config.arch.head_type == "both") and \
                (self.net.top.llm_prefix1 is not None) and (self.net.top.llm_prefix2 is not None):
+                # ★ LLM計算開始ログ
+                import time
+                llm_start = time.time()
+
                 # ★ Connector×2からprefix1とprefix2を取得
                 prefix1 = self.net.top.llm_prefix1.to(self.device_llm, dtype=self.lm_dtype)
                 prefix2 = self.net.top.llm_prefix2.to(self.device_llm, dtype=self.lm_dtype)
@@ -481,6 +485,11 @@ class HTRTrainer(nn.Module):
                 llm_loss, ce_loss_val, kl_loss_val = self.lail_loss(prefix1, prefix2, input_ids, stage_cfg)
 
                 loss_val = loss_val + (alpha_llm * k) * llm_loss.to(device)
+
+                # ★ LLM計算時間ログ
+                llm_time = time.time() - llm_start
+                if iter_idx % (k * 5) == 0:  # 40ステップ(8*5)に1回詳細ログ
+                    print(f"\n[LLM Computed] iter={iter_idx}, time={llm_time:.2f}s, CE={ce_loss_val:.2f}, KL={kl_loss_val:.2f}")
                 
             tloss_val = float(loss_val.item())
             
