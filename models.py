@@ -87,29 +87,6 @@ class CTCtopC(nn.Module):
         return y
 
 
-class CTCtopR(nn.Module):
-    def __init__(self, input_size, rnn_cfg, nclasses, rnn_type='gru'):
-        super(CTCtopR, self).__init__()
-
-        hidden, num_layers = rnn_cfg
-
-        if rnn_type == 'gru':
-            self.rec = nn.GRU(input_size, hidden, num_layers=num_layers, bidirectional=True, dropout=.2)
-        elif rnn_type == 'lstm':
-            self.rec = nn.LSTM(input_size, hidden, num_layers=num_layers, bidirectional=True, dropout=.2)
-        else:
-            print('problem! - no such rnn type is defined')
-            exit()
-        
-        self.fnl = nn.Sequential(nn.Dropout(.2), nn.Linear(2 * hidden, nclasses))
-
-    def forward(self, x):
-
-        y = x.permute(2, 3, 0, 1)[0]
-        y = self.rec(y)[0]
-        y = self.fnl(y)
-
-        return y
 
 class Connector1D(nn.Module):
     """

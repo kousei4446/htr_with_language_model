@@ -474,6 +474,10 @@ class HTRTrainer(nn.Module):
                 prefix1 = self.net.top.llm_prefix1.to(self.device_llm, dtype=self.lm_dtype)
                 prefix2 = self.net.top.llm_prefix2.to(self.device_llm, dtype=self.lm_dtype)
 
+                # ★ prefix の正規化（数値安定性向上）
+                prefix1 = F.normalize(prefix1, p=2, dim=-1) * (llm_hidden_size ** 0.5)
+                prefix2 = F.normalize(prefix2, p=2, dim=-1) * (llm_hidden_size ** 0.5)
+
                 # トークナイズ → ids を LLM デバイスへ
                 tok = llm_tokenizer(list(transcr), return_tensors='pt', padding=True, add_special_tokens=True)
                 input_ids = tok['input_ids'].to(self.device_llm)
@@ -487,24 +491,36 @@ class HTRTrainer(nn.Module):
                 # ★ 修正: k倍のスケーリングを削除（alpha_llmのみでスケール）
                 loss_val = loss_val + alpha_llm * llm_loss.to(device)
 
-                # ★ LLM計算時間ログ
+                # ★ LLM計算時間ログ + 詳細診断
                 llm_time = time.time() - llm_start
-                if iter_idx % (k * 5) == 0:  # 40ステップ(8*5)に1回詳細ログ
-                    print(f"\n[LLM Computed] iter={iter_idx}, time={llm_time:.2f}s, CE={ce_loss_val:.2f}, KL={kl_loss_val:.2f}")
+                print(f"\n[LLM Computed] iter={iter_idx}, time={llm_time:.2f}s, CE={ce_loss_val:.2f}, KL={kl_loss_val:.2f}, total_loss={float(loss_val.item()):.2f}")
+
+                # ★ LLM損失の異常値チェック
+                if float(llm_loss.item()) > 100.0:
+                    print(f"[WARNING] LLM loss is extremely high: {float(llm_loss.item()):.2f}")
+                if float(loss_val.item()) > 500.0:
+                    print(f"[WARNING] Total loss is extremely high: {float(loss_val.item()):.2f}, may cause gradient explosion")
                 
             tloss_val = float(loss_val.item())
-            
-        
+
+            # ★ backward前の損失値チェック
+            if not torch.isfinite(loss_val):
+                print(f"\n[ERROR] loss_val has NaN/Inf before backward! iter={iter_idx}")
+                print(f"  ctc_only={float(ctc_only.item()):.2f}, llm_loss={float(llm_loss.item()):.2f}")
+                print(f"  Skipping backward and continuing...")
+                continue
+
             loss_val.backward()
+            # ★ TensorBoardログ：LLM計算したステップのみce_loss/kl_lossを記録
             self.tb.log_train_step(
                 ctc_only=float(ctc_only.item()),
-                llm_loss=float(llm_loss.item()),
+                llm_loss=float(llm_loss.item()) if use_llm else None,  # LLM計算しないステップはNone
                 total=float(loss_val.item()),
                 stage=self.stage_monitor.stage,
                 ratio_ema=self.stage_monitor.ratio_ema,
                 grad_ema=self.stage_monitor.grad_ema,
-                ce_loss=ce_loss_val,
-                kl_loss=kl_loss_val
+                ce_loss=ce_loss_val if use_llm else None,
+                kl_loss=kl_loss_val if use_llm else None
             )
 
             # ★ Connector×2の勾配を計算
@@ -531,14 +547,28 @@ class HTRTrainer(nn.Module):
                 k=k
             )
 
-            # ★ Gradient clipping を追加（NaN/Inf防止）- より厳しく
-            torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=1.0)
+            # ★ backward直後：勾配のNaN検出（clipping前）
+            has_nan_before_clip = False
+            nan_layer_name = None
+            for name, param in self.net.named_parameters():
+                if param.grad is not None and not torch.isfinite(param.grad).all():
+                    has_nan_before_clip = True
+                    nan_layer_name = name
+                    print(f"\n[WARNING] Gradient NaN/Inf detected in {name} (before clipping)")
+                    # ★ 詳細診断：このステップの情報
+                    print(f"  iter={iter_idx}, use_llm={use_llm}, ctc_loss={float(ctc_only.item()):.2f}, total_loss={tloss_val:.2f}")
+                    if use_llm:
+                        print(f"  llm_loss={float(llm_loss.item()):.2f}, CE={ce_loss_val:.2f}, KL={kl_loss_val:.2f}")
+                    break
 
-            # ★ パラメータのNaN検出（optimizer.step前）
+            # ★ Gradient clipping を追加（NaN/Inf防止）- より厳しく
+            total_norm = torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=1.0)
+
+            # ★ clipping後の再チェック
             has_nan = False
             for name, param in self.net.named_parameters():
                 if param.grad is not None and not torch.isfinite(param.grad).all():
-                    print(f"[WARNING] Gradient NaN/Inf in {name}, skipping optimizer step")
+                    print(f"[WARNING] Gradient NaN/Inf in {name} after clipping, skipping optimizer step")
                     has_nan = True
                     break
 

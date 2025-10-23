@@ -17,12 +17,13 @@ class TBLogger:
         if not self.enabled: return
         w = self.writer
         w.add_scalar('loss/ctc_only', ctc_only, self.global_step)
-        w.add_scalar('loss/llm', llm_loss, self.global_step)
+        # ★ LLM損失はNoneでなければ記録（32ステップごとのみ）
+        if llm_loss is not None: w.add_scalar('loss/llm', llm_loss, self.global_step)
         w.add_scalar('loss/total', total, self.global_step)
         w.add_scalar('monitor/stage', stage, self.global_step)
         if ratio_ema is not None: w.add_scalar('monitor/ratio_ema', ratio_ema, self.global_step)
         if grad_ema  is not None: w.add_scalar('monitor/grad_ema',  grad_ema,  self.global_step)
-        # ★ LAIL損失の内訳
+        # ★ LAIL損失の内訳（LLM計算したステップのみ）
         if ce_loss is not None: w.add_scalar('loss/llm_ce', ce_loss, self.global_step)
         if kl_loss is not None: w.add_scalar('loss/llm_kl', kl_loss, self.global_step)
         self.global_step += 1
