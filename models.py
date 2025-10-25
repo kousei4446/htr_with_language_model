@@ -400,8 +400,8 @@ class CTCtopB(nn.Module):
 
             # LLM呼び出し（シンプルに！）
             output_llm = self.llm(
-                inputs_embeds=inputs_embeds,  # (batch, 64, 4096)
-                labels=labels                  # (batch, 64) ← 長さ一致！
+                inputs_embeds=inputs_embeds.half(),  # (batch, 64, 4096) float16に変換
+                labels=labels                         # (batch, 64) ← 長さ一致！
             )
 
         if self.training:
