@@ -26,7 +26,7 @@ arch:
 train:
   lr: 1e-3
   num_epochs: 800
-  batch_size: 16
+  batch_size: 8
   scheduler: 'mstep'  # right now only 'mstep' is supported, i.e. multistep
   save_every_k_epochs: 50
   num_workers: 8

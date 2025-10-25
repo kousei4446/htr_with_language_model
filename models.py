@@ -263,24 +263,23 @@ class LLMWithLLaMA(nn.Module):
         self,
         model_name: str = "meta-llama/Meta-Llama-3-8B",  # ベースモデル（推奨）
         # model_name: str = "meta-llama/Meta-Llama-3-8B-Instruct",  # Instructモデル
-        device_map: str = "auto",
+        device: str = "cpu",  # デフォルトCPUでロード→後でnet.to(device)で移動
     ):
         """
         Args:
             model_name: HuggingFaceのモデル名
-            use_fp16: float16を使うか（メモリ削減）
-            device_map: デバイスの配置方法
+            device: 使用するデバイス（'cuda'または'cpu'）
         """
         super().__init__()
-        
-        print(f"📦 Loading model: {model_name}")
-        
-        # LLaMAモデルのロード
 
+        print(f"📦 Loading model: {model_name}")
+
+        # LLaMAモデルのロード（fp16でメモリ削減）
         self.model = LlamaForCausalLM.from_pretrained(
             model_name,
-            device_map=device_map,
-        )
+            torch_dtype=torch.float16,  # メモリ削減: 16GB→8GB
+            low_cpu_mem_usage=True,
+        ).to(device)
         
         # トークナイザーのロード
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
