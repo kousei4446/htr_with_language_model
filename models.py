@@ -224,10 +224,11 @@ class QFormer(nn.Module):
 
 
 class Connector(nn.Module):
-    """Q-Former + 2段階拡張（バランス型）
+    """Q-Former + 2段階拡張（Llama-3.2-3B用）
 
-    パラメータ数: 約7.92M (従来11.16Mから29%削減)
+    パラメータ数: 約4.92M (8B用の7.92Mから38%削減)
     トークン数: 128 → 64 (50%削減)
+    出力次元: 2048 (Llama-3.2-3Bのhidden_sizeに対応)
     """
     def __init__(self, input_dim=512, num_queries=64):
         super().__init__()
@@ -239,18 +240,18 @@ class Connector(nn.Module):
             num_heads=8
         )
 
-        # 2段階拡張: 512 → 1024 → 4096
+        # 2段階拡張: 512 → 1024 → 2048 (Llama-3.2-3B用)
         self.expansion = nn.Sequential(
             nn.Linear(512, 1024),
             nn.GELU(),
-            nn.Linear(1024, 4096),
-            nn.LayerNorm(4096),
+            nn.Linear(1024, 2048),
+            nn.LayerNorm(2048),
         )
 
     def forward(self, x):
         # x: (batch, 128, 512)
         x = self.qformer(x)      # (batch, 64, 512)
-        x = self.expansion(x)    # (batch, 64, 4096)
+        x = self.expansion(x)    # (batch, 64, 2048)
         return x
 
 
@@ -261,8 +262,8 @@ class LLMWithLLaMA(nn.Module):
     """
     def __init__(
         self,
-        model_name: str = "meta-llama/Meta-Llama-3-8B",  # ベースモデル（推奨）
-        # model_name: str = "meta-llama/Meta-Llama-3-8B-Instruct",  # Instructモデル
+        model_name: str = "meta-llama/Llama-3.2-3B",  # 軽量モデル（3B）
+        # model_name: str = "meta-llama/Meta-Llama-3-8B",  # ベースモデル（8B）
     ):
         """
         Args:
@@ -388,9 +389,9 @@ class CTCtopB(nn.Module):
             # Forward/Backward方向を統合
             y1_llm = self.rnn_projection(y1_llm)  # (width, llm_batch, 512)
 
-            # Connectorで4096次元に変換
+            # Connectorで2048次元に変換 (Llama-3.2-3B用)
             prefix_input = y1_llm.permute(1, 0, 2)  # (llm_batch, width, 512)
-            inputs_embeds = self.connector(prefix_input)   # (llm_batch, 64, 4096)
+            inputs_embeds = self.connector(prefix_input)   # (llm_batch, 64, 2048)
 
             # テキストをトークン化（max_length=64で統一）
             llm_labels = self.llm.tokenizer(
@@ -404,7 +405,7 @@ class CTCtopB(nn.Module):
 
             # LLM呼び出し（シンプルに！）
             output_llm = self.llm(
-                inputs_embeds=inputs_embeds.half(),  # (batch, 64, 4096) float16に変換
+                inputs_embeds=inputs_embeds.half(),  # (batch, 64, 2048) float16に変換
                 labels=labels                         # (batch, 64) ← 長さ一致！
             )
 
