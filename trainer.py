@@ -129,7 +129,10 @@ class HTRTrainer(nn.Module):
 
         classes = self.classes['classes']
 
-        net = HTRNet(config.arch, len(classes) + 1)
+        # use_llm フラグを取得（デフォルト: True）
+        use_llm = config.train.get('use_llm', True)
+
+        net = HTRNet(config.arch, len(classes) + 1, use_llm=use_llm)
         
         if config.resume is not None:
             _ = init_from_stage1(net, config.resume) 

@@ -328,13 +328,13 @@ class LLMWithLLaMA(nn.Module):
         
         
 class CTCtopB(nn.Module):
-    def __init__(self, input_size, rnn_cfg, nclasses, rnn_type='gru',d_llm=512, enable_connector=True):
+    def __init__(self, input_size, rnn_cfg, nclasses, rnn_type='gru', d_llm=512, enable_connector=True, use_llm=False):
         super(CTCtopB, self).__init__()
 
         hidden, num_layers = rnn_cfg
-        
+
         RNN = nn.GRU if rnn_type == 'gru' else nn.LSTM
-        
+
         self.rec1 = RNN(input_size, hidden, num_layers=1, bidirectional=True, dropout=0.0)
 
         # Bidirectional RNN出力を統合する層
@@ -347,17 +347,24 @@ class CTCtopB(nn.Module):
         self.recN = None
         if num_layers > 1:
             self.recN = RNN(2*hidden, hidden, num_layers=num_layers-1, bidirectional=True, dropout=.2)
-        
-            
+
+
         self.fnl = nn.Sequential(nn.Dropout(.5), nn.Linear(2 * hidden, nclasses))
 
-        self.cnn = nn.Sequential(nn.Dropout(.5), 
+        self.cnn = nn.Sequential(nn.Dropout(.5),
                                  nn.Conv2d(input_size, nclasses, kernel_size=(1, 3), stride=1, padding=(0, 1))
         )
-        
-        # Connector: RNN第1層出力(512次元)を4096次元に拡張
-        self.connector = Connector(input_dim=512, num_queries=64)
-        self.llm = LLMWithLLaMA()
+
+        # LLM使用時のみ Connector と LLM をロード
+        self.use_llm = use_llm
+        if use_llm:
+            print("🔥 Loading LLM components (Connector + LLaMA-3-8B)...")
+            self.connector = Connector(input_dim=512, num_queries=64)
+            self.llm = LLMWithLLaMA()
+        else:
+            print("⚡ LLM disabled: Using CNN shortcut only")
+            self.connector = None
+            self.llm = None
         
         
     def forward(self, x, y_llm=None, transcr_llm=None):
@@ -374,9 +381,9 @@ class CTCtopB(nn.Module):
         y = self.recN(y1)[0]
         y = self.fnl(y)
 
-        # LLM処理（選択されたサンプルのみ）
+        # LLM処理（use_llm=true かつ 選択されたサンプルのみ）
         output_llm = None
-        if y_llm is not None and transcr_llm is not None and self.training:
+        if self.use_llm and y_llm is not None and transcr_llm is not None and self.training:
             # y_llmからRNN第1層の出力を取得
             y_llm_seq = y_llm.permute(2, 3, 0, 1)[0]  # (width, llm_batch, 256)
             y1_llm = self.rec1(y_llm_seq)[0]  # (width, llm_batch, 512)
@@ -411,10 +418,10 @@ class CTCtopB(nn.Module):
 
 
 class HTRNet(nn.Module):
-    def __init__(self, arch_cfg, nclasses):
+    def __init__(self, arch_cfg, nclasses, use_llm=False):
         super(HTRNet, self).__init__()
 
-        if arch_cfg.stn: 
+        if arch_cfg.stn:
             raise NotImplementedError('Spatial Transformer Networks not implemented - you can easily build your own!')
             #self.stn = STN()
         else:
@@ -436,7 +443,7 @@ class HTRNet(nn.Module):
         elif head=='rnn':
             self.top = CTCtopR(hidden, (arch_cfg.rnn_hidden_size, arch_cfg.rnn_layers), nclasses, rnn_type=arch_cfg.rnn_type)
         elif head=='both':
-            self.top = CTCtopB(hidden, (arch_cfg.rnn_hidden_size, arch_cfg.rnn_layers), nclasses, rnn_type=arch_cfg.rnn_type)
+            self.top = CTCtopB(hidden, (arch_cfg.rnn_hidden_size, arch_cfg.rnn_layers), nclasses, rnn_type=arch_cfg.rnn_type, use_llm=use_llm)
 
     def forward(self, x, img_llm=None, transcr_llm=None):
         """
