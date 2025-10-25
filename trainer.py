@@ -288,14 +288,13 @@ class HTRTrainer(nn.Module):
             loss_val.backward()
             self.optimizer.step()
 
-            # TensorBoardにログ記録
-            self.logger.log_batch_loss(
-                epoch=epoch,
-                total_loss=tloss_val,
-                ctc_loss=ctc_loss_val.item(),
-                aux_loss=aux_loss_val.item() if aux_loss_val is not None else None,
-                llm_loss=llm_loss_val.item() if llm_loss_val is not None else None
-            )
+            # エポック平均計算用にバッファに保存（バッチごとのログは削除）
+            self.logger.epoch_losses['total'].append(tloss_val)
+            self.logger.epoch_losses['ctc'].append(ctc_loss_val.item())
+            if aux_loss_val is not None:
+                self.logger.epoch_losses['aux'].append(aux_loss_val.item())
+            if llm_loss_val is not None:
+                self.logger.epoch_losses['llm'].append(llm_loss_val.item())
 
             t.set_postfix(values='loss : {:.2f}'.format(tloss_val))
 
