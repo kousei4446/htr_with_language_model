@@ -228,9 +228,9 @@ class HTRTrainer(nn.Module):
 
             img = img.to(device)
 
-            # labels を先に定義（全サンプル用）
-            labels = torch.IntTensor([self.classes['c2i'][c] for c in ''.join(transcr)])
-            label_lens = torch.IntTensor([len(t) for t in transcr])
+            # labels を先に定義（全サンプル用）- CTC用にint64でGPUに配置
+            labels = torch.LongTensor([self.classes['c2i'][c] for c in ''.join(transcr)]).to(device)
+            label_lens = torch.LongTensor([len(t) for t in transcr]).to(device)
 
             # LLM使用フラグを取得
             use_llm = config.train.get('use_llm', True)
@@ -260,7 +260,7 @@ class HTRTrainer(nn.Module):
                 output = self.net(img)
                 aux_output, llm_output = None, None
 
-            act_lens = torch.IntTensor(img.size(0)*[output.size(0)])
+            act_lens = torch.LongTensor(img.size(0)*[output.size(0)]).to(device)
 
             # CTC損失計算
             ctc_loss_val = self.ctc_loss(output, labels, act_lens, label_lens)
