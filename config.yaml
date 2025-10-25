@@ -30,7 +30,7 @@ train:
   scheduler: 'mstep'  # right now only 'mstep' is supported, i.e. multistep
   save_every_k_epochs: 50
   num_workers: 4
-  use_llm: true  # Enable LLM-based learning (true/false)
+  use_llm: false  # Enable LLM-based learning (true/false)
   llm_sample_ratio: 0.125  # 1/8 of samples per batch use LLM (only when use_llm=true)
 
 # evaluation
@@ -42,4 +42,4 @@ eval:
 
 # model saving and logging
 model:
-  save_dir: './saved_models/10-24_llm-mobilevit'
+  save_dir: './saved_models/10-24_onlymobilevit'

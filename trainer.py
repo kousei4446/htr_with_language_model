@@ -139,6 +139,11 @@ class HTRTrainer(nn.Module):
             
         net.to(device)
 
+        # LLM使用時はデバイス確認
+        if use_llm and hasattr(net.top, 'llm') and net.top.llm is not None:
+            llm_device = next(net.top.llm.model.parameters()).device
+            print(f'🚀 LLM moved to: {llm_device}')
+
         # print number of parameters
         n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
         print('Number of parameters: {}'.format(n_params))
