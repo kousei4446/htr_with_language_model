@@ -1,6 +1,12 @@
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    LlamaForCausalLM,
+)
+from typing import List, Optional, Dict, Union
 
 class BasicBlock(nn.Module):
     expansion = 1
@@ -174,7 +180,154 @@ class CTCtopR(nn.Module):
         return y
 
 
-    
+class QFormer(nn.Module):
+    """BLIP-2スタイルのQ-Former: 128トークン→64トークンに圧縮"""
+    def __init__(self, input_dim=512, num_queries=64, num_heads=8):
+        super().__init__()
+
+        # Learnable queries
+        self.queries = nn.Parameter(torch.randn(num_queries, input_dim))
+
+        # Cross-attention
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=input_dim,
+            num_heads=num_heads,
+            batch_first=True
+        )
+
+        # Feed-forward network
+        self.ffn = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, input_dim * 4),
+            nn.GELU(),
+            nn.Linear(input_dim * 4, input_dim)
+        )
+
+        self.norm = nn.LayerNorm(input_dim)
+
+    def forward(self, x):
+        # x: (batch, 128, 512)
+        batch_size = x.size(0)
+
+        # Expand queries for batch
+        queries = self.queries.unsqueeze(0).expand(batch_size, -1, -1)
+        # (batch, 64, 512)
+
+        # Cross-attention: queries attend to x
+        attn_out, _ = self.cross_attn(queries, x, x)
+        queries = queries + attn_out  # Residual connection
+
+        # Feed-forward
+        queries = queries + self.ffn(self.norm(queries))  # Residual connection
+
+        return queries  # (batch, 64, 512)
+
+
+class Connector(nn.Module):
+    """Q-Former + 2段階拡張（バランス型）
+
+    パラメータ数: 約7.92M (従来11.16Mから29%削減)
+    トークン数: 128 → 64 (50%削減)
+    """
+    def __init__(self, input_dim=512, num_queries=64):
+        super().__init__()
+
+        # Q-Former: 128トークン → 64トークンに圧縮
+        self.qformer = QFormer(
+            input_dim=input_dim,
+            num_queries=num_queries,
+            num_heads=8
+        )
+
+        # 2段階拡張: 512 → 1024 → 4096
+        self.expansion = nn.Sequential(
+            nn.Linear(512, 1024),
+            nn.GELU(),
+            nn.Linear(1024, 4096),
+            nn.LayerNorm(4096),
+        )
+
+    def forward(self, x):
+        # x: (batch, 128, 512)
+        x = self.qformer(x)      # (batch, 64, 512)
+        x = self.expansion(x)    # (batch, 64, 4096)
+        return x
+
+
+class LLMWithLLaMA(nn.Module):
+    """
+    LLaMAモデルのシンプルなラッパークラス
+    テキスト生成、ファインチューニング、推論を簡単に実行できる
+    """
+    def __init__(
+        self,
+        model_name: str = "meta-llama/Meta-Llama-3-8B",  # ベースモデル（推奨）
+        # model_name: str = "meta-llama/Meta-Llama-3-8B-Instruct",  # Instructモデル
+        device_map: str = "auto",
+    ):
+        """
+        Args:
+            model_name: HuggingFaceのモデル名
+            use_fp16: float16を使うか（メモリ削減）
+            device_map: デバイスの配置方法
+        """
+        super().__init__()
+        
+        print(f"📦 Loading model: {model_name}")
+        
+        # LLaMAモデルのロード
+
+        self.model = LlamaForCausalLM.from_pretrained(
+            model_name,
+            device_map=device_map,
+        )
+        
+        # トークナイザーのロード
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        
+        # パディングトークンの設定
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        
+        # モデル情報の取得
+        self.config = self.model.config
+        self.device = next(self.model.parameters()).device
+        
+        print(f"✅ Model loaded successfully!")
+        print(f"   Hidden size: {self.config.hidden_size}")
+        print(f"   Vocab size: {self.config.vocab_size}")
+        print(f"   Device: {self.device}")
+
+        # LLMパラメータを凍結（学習対象外にする）
+        self.model.requires_grad_(False)
+        print(f"🔒 LLM parameters frozen (8B params not trainable)")
+
+    def forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        labels: torch.Tensor,
+    ):
+        """
+        Simplified forward pass (参考コードベース)
+
+        Args:
+            inputs_embeds: (batch, seq_len, hidden_size) - RNN出力→Connector変換済み
+            labels: (batch, text_len) - テキストのトークンID
+
+        Returns:
+            LLM outputs (loss含む)
+        """
+        # そのまま渡す（参考コードと同じ）
+        outputs = self.model(
+            inputs_embeds=inputs_embeds,
+            labels=labels,
+            return_dict=True,
+        )
+
+        return outputs
+        
+        
 class CTCtopB(nn.Module):
     def __init__(self, input_size, rnn_cfg, nclasses, rnn_type='gru',d_llm=512, enable_connector=True):
         super(CTCtopB, self).__init__()
@@ -184,10 +337,18 @@ class CTCtopB(nn.Module):
         RNN = nn.GRU if rnn_type == 'gru' else nn.LSTM
         
         self.rec1 = RNN(input_size, hidden, num_layers=1, bidirectional=True, dropout=0.0)
-        
+
+        # Bidirectional RNN出力を統合する層
+        self.rnn_projection = nn.Sequential(
+            nn.LayerNorm(2 * hidden),  # 512次元を正規化
+            nn.Linear(2 * hidden, 2 * hidden),  # 512→512
+            nn.GELU(),
+        )
+
         self.recN = None
         if num_layers > 1:
             self.recN = RNN(2*hidden, hidden, num_layers=num_layers-1, bidirectional=True, dropout=.2)
+        
             
         self.fnl = nn.Sequential(nn.Dropout(.5), nn.Linear(2 * hidden, nclasses))
 
@@ -195,17 +356,57 @@ class CTCtopB(nn.Module):
                                  nn.Conv2d(input_size, nclasses, kernel_size=(1, 3), stride=1, padding=(0, 1))
         )
         
+        # Connector: RNN第1層出力(512次元)を4096次元に拡張
+        self.connector = Connector(input_dim=512, num_queries=64)
+        self.llm = LLMWithLLaMA()
         
-    def forward(self, x):
-
+        
+    def forward(self, x, y_llm=None, transcr_llm=None):
+        """
+        Args:
+            x: 全サンプルの特徴量 (batch_size, 256, 1, width)
+            y_llm: LLM用サンプルの特徴量 (llm_batch_size, 256, 1, width)
+            transcr_llm: LLM用の正解文字列 (llm_batch_size,)
+        """
+        # RNN処理（全サンプル）
         y = x.permute(2, 3, 0, 1)[0]
         y1 = self.rec1(y)[0]
-            
+
         y = self.recN(y1)[0]
         y = self.fnl(y)
 
+        # LLM処理（選択されたサンプルのみ）
+        output_llm = None
+        if y_llm is not None and transcr_llm is not None and self.training:
+            # y_llmからRNN第1層の出力を取得
+            y_llm_seq = y_llm.permute(2, 3, 0, 1)[0]  # (width, llm_batch, 256)
+            y1_llm = self.rec1(y_llm_seq)[0]  # (width, llm_batch, 512)
+
+            # Forward/Backward方向を統合
+            y1_llm = self.rnn_projection(y1_llm)  # (width, llm_batch, 512)
+
+            # Connectorで4096次元に変換
+            prefix_input = y1_llm.permute(1, 0, 2)  # (llm_batch, width, 512)
+            inputs_embeds = self.connector(prefix_input)   # (llm_batch, 64, 4096)
+
+            # テキストをトークン化（max_length=64で統一）
+            llm_labels = self.llm.tokenizer(
+                list(transcr_llm),
+                return_tensors="pt",
+                padding="max_length",  # 常に64トークンに統一
+                truncation=True,
+                max_length=64          # inputs_embedsと同じ長さ
+            )
+            labels = llm_labels["input_ids"].to(y_llm.device)  # (llm_batch, 64)
+
+            # LLM呼び出し（シンプルに！）
+            output_llm = self.llm(
+                inputs_embeds=inputs_embeds,  # (batch, 64, 4096)
+                labels=labels                  # (batch, 64) ← 長さ一致！
+            )
+
         if self.training:
-            return y, self.cnn(x).permute(2, 3, 0, 1)[0]
+            return y, self.cnn(x).permute(2, 3, 0, 1)[0], output_llm
         else:
             return y, self.cnn(x).permute(2, 3, 0, 1)[0]
 
@@ -238,15 +439,29 @@ class HTRNet(nn.Module):
         elif head=='both':
             self.top = CTCtopB(hidden, (arch_cfg.rnn_hidden_size, arch_cfg.rnn_layers), nclasses, rnn_type=arch_cfg.rnn_type)
 
-    def forward(self, x):
-
+    def forward(self, x, img_llm=None, transcr_llm=None):
+        """
+        Args:
+            x: 全サンプルの画像 (batch_size, C, H, W)
+            img_llm: LLM用サンプルの画像 (llm_batch_size, C, H, W)
+            transcr_llm: LLM用の正解文字列 (llm_batch_size,)
+        """
+        # 全サンプルの特徴量抽出
         if self.stn is not None:
             x = self.stn(x)
-
         y = self.features(x)
-        y = self.top(y)
+
+        # LLM用サンプルの特徴量抽出
+        y_llm = None
+        if img_llm is not None:
+            if self.stn is not None:
+                img_llm = self.stn(img_llm)
+            y_llm = self.features(img_llm)
+
+        # CTCtopBに渡す
+        if transcr_llm is not None:
+            y = self.top(y, y_llm=y_llm, transcr_llm=transcr_llm)
+        else:
+            y = self.top(y)
 
         return y
-    
-    
-    

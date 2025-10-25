@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from utils.htr_dataset import HTRDataset
+from utils.logger import HTRLogger, LLMLossTracker
 
 from models import HTRNet
 from utils.transforms import aug_transforms
@@ -67,6 +68,7 @@ class HTRTrainer(nn.Module):
         self.prepare_net()
         self.prepare_losses()
         self.prepare_optimizers()
+        self.prepare_logger()
 
 
     def prepare_dataloaders(self):
@@ -143,6 +145,8 @@ class HTRTrainer(nn.Module):
     def prepare_losses(self):
         self.ctc_loss = lambda y, t, ly, lt: nn.CTCLoss(reduction='sum', zero_infinity=True)(F.log_softmax(y, dim=2), t, ly, lt) /self.config.train.batch_size
 
+        self.lail_loss = lambda llm_output: llm_output.loss / self.config.train.batch_size if(llm_output is not None and hasattr(llm_output, 'loss')) else torch.tensor(0.0,device=self.config.device)
+
     def prepare_optimizers(self):
         config = self.config
         optimizer = torch.optim.AdamW(self.net.parameters(), config.train.lr, weight_decay=0.00005)
@@ -154,6 +158,23 @@ class HTRTrainer(nn.Module):
             self.scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, [int(.5*max_epochs), int(.75*max_epochs)])
         else:
             raise NotImplementedError('Alternative schedulers not implemented yet')
+
+    def prepare_logger(self):
+        """TensorBoardロガーを初期化"""
+        self.logger = HTRLogger(config=self.config)
+
+        # LLM使用状況を表示
+        use_llm = self.config.train.get('use_llm', True)
+        if self.config.arch.head_type == "both":
+            if use_llm:
+                llm_ratio = self.config.train.get('llm_sample_ratio', 0.125)
+                print(f'LLM Learning: ENABLED (sample_ratio={llm_ratio:.1%})')
+            else:
+                print('LLM Learning: DISABLED (using CNN shortcut only)')
+
+        # LLM損失追跡用
+        llm_ratio = self.config.train.get('llm_sample_ratio', 0.125)
+        self.llm_tracker = LLMLossTracker(llm_sample_ratio=llm_ratio)
 
     def decode(self, tdec, tdict, blank_id=0):
         
@@ -199,28 +220,95 @@ class HTRTrainer(nn.Module):
 
             img = img.to(device)
 
-            if config.arch.head_type == "both":
-                output, aux_output = self.net(img)
-            else:
-                output = self.net(img)
-
-            act_lens = torch.IntTensor(img.size(0)*[output.size(0)])
+            # labels を先に定義（全サンプル用）
             labels = torch.IntTensor([self.classes['c2i'][c] for c in ''.join(transcr)])
             label_lens = torch.IntTensor([len(t) for t in transcr])
 
-            loss_val = self.ctc_loss(output, labels, act_lens, label_lens)
+            # LLM使用フラグを取得
+            use_llm = config.train.get('use_llm', True)
 
             if config.arch.head_type == "both":
-                loss_val += 0.1 * self.ctc_loss(aux_output, labels, act_lens, label_lens)
+                if use_llm:
+                    # LLM有効: 毎バッチで1/8のサンプルをランダム選択
+                    batch_size = img.size(0)
+                    llm_ratio = config.train.get('llm_sample_ratio', 0.125)
+                    llm_batch_size = max(1, int(batch_size * llm_ratio))
+
+                    # ランダムインデックス選択
+                    indices = torch.randperm(batch_size, device='cpu')[:llm_batch_size]
+                    img_llm = img[indices]
+                    transcr_llm = [transcr[i] for i in indices]
+
+                    # モデル呼び出し（全サンプル + LLM用サンプル）
+                    output, aux_output, llm_output = self.net(
+                        img, img_llm=img_llm, transcr_llm=transcr_llm
+                    )
+                else:
+                    # LLM無効: CNN shortcut のみ使用
+                    output, aux_output, llm_output = self.net(
+                        img, img_llm=None, transcr_llm=None
+                    )
+            else:
+                output = self.net(img)
+                aux_output, llm_output = None, None
+
+            act_lens = torch.IntTensor(img.size(0)*[output.size(0)])
+
+            # CTC損失計算
+            ctc_loss_val = self.ctc_loss(output, labels, act_lens, label_lens)
+            loss_val = ctc_loss_val
+
+            # 個別の損失を記録用に保存
+            aux_loss_val = None
+            llm_loss_val = None
+
+            if config.arch.head_type == "both":
+                # 補助損失（CNN shortcut）- head_type="both" なら常に計算
+                aux_loss_val = self.ctc_loss(aux_output, labels, act_lens, label_lens)
+                loss_val += 0.1 * aux_loss_val
+
+                # LLM損失（use_llm=true の場合のみ計算）
+                if use_llm:
+                    llm_loss_raw = self.lail_loss(llm_output)
+                    if llm_loss_raw.item() > 0:
+                        llm_weight = 1.0 / llm_ratio
+                        llm_loss_val = llm_loss_raw * llm_weight
+                        loss_val += 0.1 * llm_loss_val
+                        # LLM損失トラッカーに記録
+                        self.llm_tracker.update(llm_loss_val.item())
+                    else:
+                        # LLM損失が計算されなかった
+                        self.llm_tracker.update(None)
 
             tloss_val = loss_val.item()
-        
+
             loss_val.backward()
-            self.optimizer.step()    
+            self.optimizer.step()
+
+            # TensorBoardにログ記録
+            self.logger.log_batch_loss(
+                epoch=epoch,
+                total_loss=tloss_val,
+                ctc_loss=ctc_loss_val.item(),
+                aux_loss=aux_loss_val.item() if aux_loss_val is not None else None,
+                llm_loss=llm_loss_val.item() if llm_loss_val is not None else None
+            )
 
             t.set_postfix(values='loss : {:.2f}'.format(tloss_val))
 
+        # Epoch終了時の処理
         self.sample_decoding()
+
+        # Epoch平均をログ記録
+        self.logger.log_epoch_summary(epoch)
+
+        # LLM損失の統計を表示（use_llm=true の場合のみ）
+        if config.arch.head_type == "both" and use_llm:
+            llm_stats = self.llm_tracker.get_stats()
+            print(f'[Epoch {epoch}] LLM Stats: avg_loss={llm_stats["avg_loss"]:.4f}, '
+                  f'computed_ratio={llm_stats["computation_ratio"]:.2%} '
+                  f'(expected={llm_stats["expected_ratio"]:.2%})')
+            self.llm_tracker.reset()
     
     def test(self, epoch, tset='test'):
 
@@ -263,6 +351,9 @@ class HTRTrainer(nn.Module):
         print('CER at epoch {}: {:.3f}'.format(epoch, cer_score))
         print('WER at epoch {}: {:.3f}'.format(epoch, wer_score))
 
+        # TensorBoardにログ記録
+        self.logger.log_metrics(epoch, cer_score, wer_score, split=tset)
+
         self.net.train()
 
     def save(self, epoch):
@@ -301,7 +392,11 @@ if __name__ == '__main__':
 
         htr_trainer.train(epoch)
         htr_trainer.scheduler.step()
-        
+
+        # 学習率をログ記録
+        current_lr = htr_trainer.optimizer.param_groups[0]['lr']
+        htr_trainer.logger.log_learning_rate(epoch, current_lr)
+
         if epoch == 1:
             htr_trainer.save(epoch)
 
@@ -317,4 +412,6 @@ if __name__ == '__main__':
         os.makedirs(config.model.save_dir)
     torch.save(htr_trainer.net.cpu().state_dict(), config.model.save_dir + '/{}'.format(config.save))
 
-    
+    # TensorBoardロガーを閉じる
+    htr_trainer.logger.close()
+    print('Training completed!')
