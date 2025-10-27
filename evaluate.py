@@ -30,10 +30,10 @@ class HTREval(nn.Module):
         fixed_size = (config.preproc.image_height, config.preproc.image_width)
 
         val_set = HTRDataset(dataset_folder, 'val', fixed_size=fixed_size, transforms=None)
-        print('# validation lines ' + str(val_set.__len__()))
+        # print('# validation lines ' + str(val_set.__len__()))
 
         test_set = HTRDataset(dataset_folder, 'test', fixed_size=fixed_size, transforms=None)
-        print('# testing lines ' + str(test_set.__len__()))
+        # print('# testing lines ' + str(test_set.__len__()))
 
         # load classes from the training set saved in the data folder
         classes = np.load(os.path.join(dataset_folder, 'classes.npy'))
@@ -63,23 +63,23 @@ class HTREval(nn.Module):
 
         device = config.device
 
-        print('Preparing Net - Architectural elements:')
-        print(config.arch)
+        # print('Preparing Net - Architectural elements:')
+        # print(config.arch)
 
         classes = self.classes['classes']
 
         net = HTRNet(config.arch, len(classes) + 1)
         
         if config.resume is not None:
-            print('resuming from checkpoint: {}'.format(config.resume))
+            # print('resuming from checkpoint: {}'.format(config.resume))
             load_dict = torch.load(config.resume)
             load_status = net.load_state_dict(load_dict, strict=True)
-            print(load_status)
+            # print(load_status)
         net.to(device)
 
         # print number of parameters
-        n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
-        print('Number of parameters: {}'.format(n_params))
+        # n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
+        # print('Number of parameters: {}'.format(n_params))
 
         self.net = net
 
@@ -104,10 +104,10 @@ class HTREval(nn.Module):
         else:
             print("not recognized set in test function")
 
-        print('####################### Evaluating {} set at epoch {} #######################'.format(tset, epoch))
-        
+        # print('####################### Evaluating {} set at epoch {} #######################'.format(tset, epoch))
+
         cer, wer = CER(), WER(mode=config.eval.wer_mode)
-        for (imgs, transcrs) in tqdm.tqdm(loader):
+        for (imgs, transcrs) in tqdm.tqdm(loader, disable=True):
 
             imgs = imgs.to(device)
             with torch.no_grad():
@@ -128,8 +128,8 @@ class HTREval(nn.Module):
         cer_score = cer.score()
         wer_score = wer.score()
 
-        print('CER at epoch {}: {:.3f}'.format(epoch, cer_score))
-        print('WER at epoch {}: {:.3f}'.format(epoch, wer_score))
+        print('[{}] CER at epoch {}: {:.4f}'.format(tset, epoch, cer_score))
+        print('[{}] WER at epoch {}: {:.4f}'.format(tset, epoch, wer_score))
 
         self.net.train()
 

@@ -39,10 +39,10 @@ flowchart TB
     B1[ResBlock x2 -> 64]
     MP1[MaxPool]
     MV1[MobileViT Block 1]
-    B2[ResBlock x4 -> 128]
+    B2[ResBlock x3 -> 128]
     MP2[MaxPool]
     MV2[MobileViT Block 2]
-    B3[ResBlock x4 -> 256]
+    B3[ResBlock x2 -> 256]
     COLMP[Column MaxPool<br/>-> Temporal Features]
   end
 
@@ -231,11 +231,11 @@ python demo.py config.yaml resume=./saved_models/htrnet.pt ./data/IAM/processed_
 
 ### 4. 損失関数
 ```
-L_total = L_CTC + α * L_LLM
+L_total = L_CTC + 0.1 * L_aux + 0.1 * L_LLM
 ```
-- **L_CTC**: RNN HeadとCNN Shortcutの出力に適用
-- **L_LLM**: LLMの因果言語モデリング損失（選択されたサンプルのみ）
-- **α**: LLM損失の重み（デフォルト: 1.0）
+- **L_CTC**: RNN Headの出力に適用（主損失）
+- **L_aux**: CNN Shortcutの出力に適用（補助損失、重み0.1）
+- **L_LLM**: LLMの因果言語モデリング損失（選択されたサンプルのみ、重み0.1）
 
 ---
 

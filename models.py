@@ -42,12 +42,27 @@ class MobileViTBlock(nn.Module):
         super().__init__()
         self.p = patch
 
+        # LayerNorm用のヘルパークラス
+        class ConvLayerNorm2d(nn.Module):
+            """Conv2d出力用のLayerNorm (channel-last形式で正規化)"""
+            def __init__(self, normalized_shape):
+                super().__init__()
+                self.norm = nn.LayerNorm(normalized_shape)
+
+            def forward(self, x):
+                # x: (B, C, H, W) -> (B, H, W, C)
+                x = x.permute(0, 2, 3, 1)
+                x = self.norm(x)
+                # (B, H, W, C) -> (B, C, H, W)
+                x = x.permute(0, 3, 1, 2)
+                return x
+
         self.local = nn.Sequential(
             nn.Conv2d(in_channels, in_channels, 3, padding=1, bias=False),
-            nn.BatchNorm2d(in_channels),
+            ConvLayerNorm2d(in_channels),
             nn.SiLU(inplace=True),
             nn.Conv2d(in_channels, d_model, 1, bias=False),
-            nn.BatchNorm2d(d_model),
+            ConvLayerNorm2d(d_model),
             nn.SiLU(inplace=True),
         )
 
@@ -59,7 +74,7 @@ class MobileViTBlock(nn.Module):
 
         self.fusion = nn.Sequential(
             nn.Conv2d(d_model + in_channels, in_channels, 1, bias=False),
-            nn.BatchNorm2d(in_channels),
+            ConvLayerNorm2d(in_channels),
             nn.SiLU(inplace=True),
         )
 
@@ -333,20 +348,22 @@ class CTCtopB(nn.Module):
 
         RNN = nn.GRU if rnn_type == 'gru' else nn.LSTM
 
+        # BiLSTM x3 layers (as per model_structure.md)
+        # For LLM path, we need to extract layer1 output, so separate the layers
         self.rec1 = RNN(input_size, hidden, num_layers=1, bidirectional=True, dropout=0.0)
 
-        # Bidirectional RNN出力を統合する層
+        self.recN = None
+        if num_layers > 1:
+            self.recN = RNN(2*hidden, hidden, num_layers=num_layers-1, bidirectional=True, dropout=.2)
+
+        # RNN projection layer: LayerNorm + Linear + GELU (as per model_structure.md)
         self.rnn_projection = nn.Sequential(
             nn.LayerNorm(2 * hidden),  # 512次元を正規化
             nn.Linear(2 * hidden, 2 * hidden),  # 512→512
             nn.GELU(),
         )
 
-        self.recN = None
-        if num_layers > 1:
-            self.recN = RNN(2*hidden, hidden, num_layers=num_layers-1, bidirectional=True, dropout=.2)
-
-
+        # Final CTC projection
         self.fnl = nn.Sequential(nn.Dropout(.5), nn.Linear(2 * hidden, nclasses))
 
         self.cnn = nn.Sequential(nn.Dropout(.5),
@@ -373,21 +390,27 @@ class CTCtopB(nn.Module):
             transcr_llm: LLM用の正解文字列 (llm_batch_size,)
         """
         # RNN処理（全サンプル）
-        y = x.permute(2, 3, 0, 1)[0]
-        y1 = self.rec1(y)[0]
+        y = x.permute(2, 3, 0, 1)[0]  # (width, batch, 256)
+        y1 = self.rec1(y)[0]  # (width, batch, 512) - BiLSTM layer1 output
 
-        y = self.recN(y1)[0]
-        y = self.fnl(y)
+        # Pass through remaining layers
+        if self.recN is not None:
+            y_rnn = self.recN(y1)[0]  # (width, batch, 512) - BiLSTM layers 2-3 output
+        else:
+            y_rnn = y1
+
+        # Apply projection: LayerNorm + Linear + GELU
+        y_proj = self.rnn_projection(y_rnn)  # (width, batch, 512)
+
+        # Final CTC projection
+        y_ctc = self.fnl(y_proj)  # (width, batch, nclasses)
 
         # LLM処理（use_llm=true かつ 選択されたサンプルのみ）
         output_llm = None
         if self.use_llm and y_llm is not None and transcr_llm is not None and self.training:
-            # y_llmからRNN第1層の出力を取得
+            # y_llmからRNN layer1の出力を取得（as per model_structure.md）
             y_llm_seq = y_llm.permute(2, 3, 0, 1)[0]  # (width, llm_batch, 256)
-            y1_llm = self.rec1(y_llm_seq)[0]  # (width, llm_batch, 512)
-
-            # Forward/Backward方向を統合
-            y1_llm = self.rnn_projection(y1_llm)  # (width, llm_batch, 512)
+            y1_llm = self.rec1(y_llm_seq)[0]  # (width, llm_batch, 512) - layer1 output only
 
             # Connectorで3072次元に変換 (Llama-3.2-3B用)
             prefix_input = y1_llm.permute(1, 0, 2)  # (llm_batch, width, 512)
@@ -410,9 +433,9 @@ class CTCtopB(nn.Module):
             )
 
         if self.training:
-            return y, self.cnn(x).permute(2, 3, 0, 1)[0], output_llm
+            return y_ctc, self.cnn(x).permute(2, 3, 0, 1)[0], output_llm
         else:
-            return y, self.cnn(x).permute(2, 3, 0, 1)[0]
+            return y_ctc, self.cnn(x).permute(2, 3, 0, 1)[0]
 
 
 class HTRNet(nn.Module):

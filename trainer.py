@@ -151,9 +151,9 @@ class HTRTrainer(nn.Module):
         self.net = net
 
     def prepare_losses(self):
-        self.ctc_loss = lambda y, t, ly, lt: nn.CTCLoss(reduction='sum', zero_infinity=True)(F.log_softmax(y, dim=2), t, ly, lt) /self.config.train.batch_size
+        self.ctc_loss = lambda y, t, ly, lt: nn.CTCLoss(reduction='mean', zero_infinity=True)(F.log_softmax(y, dim=2), t, ly, lt) 
 
-        self.lail_loss = lambda llm_output: llm_output.loss / self.config.train.batch_size if(llm_output is not None and hasattr(llm_output, 'loss')) else torch.tensor(0.0,device=self.config.device)
+        self.lail_loss = lambda llm_output: llm_output.loss if(llm_output is not None and hasattr(llm_output, 'loss')) else torch.tensor(0.0,device=self.config.device)
 
     def prepare_optimizers(self):
         config = self.config
