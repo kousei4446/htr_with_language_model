@@ -378,8 +378,8 @@ class CTCtopB(nn.Module):
         # LLM使用時のみ Connector と LLM をロード
         self.use_llm = use_llm
         if use_llm:
-            print("🔥 Loading LLM components (Connector + LLaMA-3-8B)...")
-            self.connector = Connector(input_dim=512, num_queries=64)
+            print("🔥 Loading LLM components (Connector + LLaMA-3.2-3B)...")
+            self.connector = Connector(input_dim=512, num_queries=20)  # 64→20に変更
             self.llm = LLMWithLLaMA()
         else:
             print("⚡ LLM disabled: Using CNN shortcut only")
