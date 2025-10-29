@@ -1,4 +1,4 @@
-resume: 
+resume:
 save: './temp.pt'
 
 device: 'cuda:0'
@@ -42,4 +42,4 @@ eval:
 
 # model saving and logging
 model:
-  save_dir: './saved_models/10-24_llmmobilevit'
+  save_dir: './saved_models/10-29_llmmobilevit'

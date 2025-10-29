@@ -152,7 +152,7 @@ class HTRTrainer(nn.Module):
 
     def prepare_losses(self):
         self.ctc_loss = lambda y, t, ly, lt: nn.CTCLoss(reduction='mean', zero_infinity=True)(F.log_softmax(y, dim=2), t, ly, lt) 
-
+        
         self.lail_loss = lambda llm_output: llm_output.loss if(llm_output is not None and hasattr(llm_output, 'loss')) else torch.tensor(0.0,device=self.config.device)
 
     def prepare_optimizers(self):
@@ -280,8 +280,8 @@ class HTRTrainer(nn.Module):
                     llm_loss_raw = self.lail_loss(llm_output)
                     if llm_loss_raw.item() > 0:
                         llm_weight = 1.0 / llm_ratio
-                        llm_loss_val = llm_loss_raw * llm_weight
-                        loss_val += 0.1 * llm_loss_val
+                        llm_loss_val = (llm_loss_raw * llm_weight)*10
+                        loss_val += llm_loss_val
                         # LLM損失トラッカーに記録
                         self.llm_tracker.update(llm_loss_val.item())
                     else:
