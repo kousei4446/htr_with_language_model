@@ -368,13 +368,6 @@ class CTCtopB(nn.Module):
         if num_layers > 1:
             self.recN = RNN(2*hidden, hidden, num_layers=num_layers-1, bidirectional=True, dropout=.2)
 
-        # RNN projection layer: LayerNorm + Linear + GELU (as per model_structure.md)
-        self.rnn_projection = nn.Sequential(
-            nn.LayerNorm(2 * hidden),  # 512次元を正規化
-            nn.Linear(2 * hidden, 2 * hidden),  # 512→512
-            nn.GELU(),
-        )
-
         # Final CTC projection
         self.fnl = nn.Sequential(nn.Dropout(.5), nn.Linear(2 * hidden, nclasses))
 
@@ -411,11 +404,8 @@ class CTCtopB(nn.Module):
         else:
             y_rnn = y1
 
-        # Apply projection: LayerNorm + Linear + GELU
-        y_proj = self.rnn_projection(y_rnn)  # (width, batch, 512)
-
         # Final CTC projection
-        y_ctc = self.fnl(y_proj)  # (width, batch, nclasses)
+        y_ctc = self.fnl(y_rnn)  # (width, batch, nclasses)
 
         # LLM処理（use_llm=true かつ 選択されたサンプルのみ）
         output_llm = None
@@ -426,7 +416,19 @@ class CTCtopB(nn.Module):
 
             # Connectorで3072次元に変換 (Llama-3.2-3B用)
             prefix_input = y1_llm.permute(1, 0, 2)  # (llm_batch, width, 512)
+
+            # 🔍 デバッグ: 形状確認
+            print(f"\n{'='*60}")
+            print(f"[DEBUG] Shape verification")
+            print(f"{'='*60}")
+            print(f"y1_llm.shape:       {y1_llm.shape} (width, llm_batch, 512)")
+            print(f"prefix_input.shape: {prefix_input.shape} (llm_batch, width, 512)")
+            print(f"Expected:           (llm_batch, 128, 512)")
+
             inputs_embeds = self.connector(prefix_input)   # (llm_batch, 20, 3072)
+
+            print(f"inputs_embeds.shape: {inputs_embeds.shape}")
+            print(f"Expected:            (llm_batch, 20, 3072)")
 
             # テキストをトークン化（max_length=20で統一）
             llm_labels = self.llm.tokenizer(
@@ -438,7 +440,11 @@ class CTCtopB(nn.Module):
             )
             labels = llm_labels["input_ids"].to(y_llm.device)  # (llm_batch, 20)
 
-            # LLM呼び出し（シンプルに！）
+            print(f"labels.shape:        {labels.shape}")
+            print(f"Expected:            (llm_batch, 20)")
+            print(f"{'='*60}\n")
+
+
             output_llm = self.llm(
                 inputs_embeds=inputs_embeds.half(),  # (batch, 20, 3072) float16に変換
                 labels=labels                         # (batch, 20) ← 長さ一致！
