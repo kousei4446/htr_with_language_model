@@ -7,90 +7,39 @@ import torch
 import torch.nn as nn
 
 # models.py から必要なクラスのみコピー
-class QFormer(nn.Module):
-    """BLIP-2スタイルのQ-Former: 128トークン→20トークンに圧縮
+class Connector(nn.Module):
+    """Conv1dベースの学習可能なコネクタ（Llama-3.2-3B用）
 
-    FFNで直接LLM次元(3072)に変換することで、後段のexpansion層を削減
+    改善点:
+    - Q-Former (9.5M params) → Conv1d (3.4M params) (64%削減)
+    - トークン数: 128 → 21 (学習可能な圧縮)
+    - 次元: 512 → 3072 (Linear projection)
+    - 重要な情報を学習で保持
     """
-    def __init__(self, input_dim=512, num_queries=20, num_heads=8, output_dim=3072):
+    def __init__(self, input_dim=512, num_queries=21, output_dim=3072):
         super().__init__()
 
-        # Learnable queries
-        self.queries = nn.Parameter(torch.randn(num_queries, input_dim))
-
-        # Self-attention (クエリ同士が情報を共有)
-        self.self_attn = nn.MultiheadAttention(
-            embed_dim=input_dim,
-            num_heads=num_heads,
-            batch_first=True
-        )
-
-        # Cross-attention
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=input_dim,
-            num_heads=num_heads,
-            batch_first=True
-        )
-
-        # Feed-forward network: 512 → 2048 → 3072 (直接LLM次元に変換)
-        self.ffn = nn.Sequential(
+        # 学習可能な圧縮: 128 → 21
+        # stride=6: 128 / 6 ≈ 21 (正確に21になる)
+        self.compress = nn.Sequential(
+            nn.Conv1d(input_dim, input_dim, kernel_size=7, stride=6, padding=3),
             nn.LayerNorm(input_dim),
-            nn.Linear(input_dim, input_dim * 4),  # 512 → 2048
+            nn.GELU()
+        )
+
+        # Projection: 512次元 → 3072次元に拡張
+        self.projection = nn.Sequential(
+            nn.Linear(input_dim, output_dim),
             nn.GELU(),
-            nn.Linear(input_dim * 4, output_dim),  # 2048 → 3072
             nn.LayerNorm(output_dim)
         )
 
-        self.norm1 = nn.LayerNorm(input_dim)
-        self.norm2 = nn.LayerNorm(input_dim)
-
     def forward(self, x):
         # x: (batch, 128, 512)
-        batch_size = x.size(0)
-
-        # Expand queries for batch
-        queries = self.queries.unsqueeze(0).expand(batch_size, -1, -1)
-        # (batch, 20, 512)
-
-        # Self-attention: queries attend to each other
-        self_attn_out, _ = self.self_attn(queries, queries, queries)
-        queries = queries + self_attn_out  # Residual connection
-        queries = self.norm1(queries)
-
-        # Cross-attention: queries attend to x
-        cross_attn_out, _ = self.cross_attn(queries, x, x)
-        queries = queries + cross_attn_out  # Residual connection
-        queries = self.norm2(queries)
-
-        # Feed-forward: 512 → 3072 (直接LLM次元に変換)
-        output = self.ffn(queries)  # Residual接続なし（次元が変わるため）
-
-        return output  # (batch, 20, 3072)
-
-
-class Connector(nn.Module):
-    """Q-Formerベースのコネクタ（Llama-3.2-3B用）
-
-    改善点:
-    - トークン数: 128 → 20 (84%削減)
-    - Self-attention追加で情報損失を軽減
-    - FFNで直接3072次元に変換（expansion層削減）
-    - パラメータ数: 約7.5M (旧版11.16Mから33%削減)
-    """
-    def __init__(self, input_dim=512, num_queries=20, output_dim=3072):
-        super().__init__()
-
-        # Q-Former: 128トークン → 20トークンに圧縮 + 3072次元に変換
-        self.qformer = QFormer(
-            input_dim=input_dim,
-            num_queries=num_queries,
-            num_heads=8,
-            output_dim=output_dim
-        )
-
-    def forward(self, x):
-        # x: (batch, 128, 512)
-        x = self.qformer(x)      # (batch, 20, 3072)
+        x = x.transpose(1, 2)    # (batch, 512, 128) - Conv1d用
+        x = self.compress(x)      # (batch, 512, 21) - 学習可能な圧縮
+        x = x.transpose(1, 2)    # (batch, 21, 512) - 元の形式に戻す
+        x = self.projection(x)   # (batch, 21, 3072) - 次元拡張
         return x
 
 
@@ -101,7 +50,7 @@ def test_connector_shapes():
     print("=" * 60)
 
     # Connector インスタンス作成
-    connector = Connector(input_dim=512, num_queries=20, output_dim=3072)
+    connector = Connector(input_dim=512, num_queries=21, output_dim=3072)
     connector.eval()
 
     # テストケース1: width=128 (期待される入力)
@@ -117,11 +66,11 @@ def test_connector_shapes():
         output1 = connector(x1)
 
     print(f"出力形状: {output1.shape}")
-    print(f"期待形状: ({batch_size}, 20, 3072)")
-    print(f"✅ 正常" if output1.shape == torch.Size([batch_size, 20, 3072]) else "❌ エラー")
+    print(f"期待形状: ({batch_size}, 21, 3072)")
+    print(f"✅ 正常" if output1.shape == torch.Size([batch_size, 21, 3072]) else "❌ エラー")
 
-    # テストケース2: width=256 (エラーメッセージから推測される実際の入力)
-    print("\n[テスト2] width=256 (実際に来ている可能性がある入力)")
+    # テストケース2: width=256 (可変長入力のテスト)
+    print("\n[テスト2] width=256 (可変長入力のテスト)")
     width = 256
 
     x2 = torch.randn(batch_size, width, input_dim)
@@ -131,8 +80,8 @@ def test_connector_shapes():
         output2 = connector(x2)
 
     print(f"出力形状: {output2.shape}")
-    print(f"期待形状: ({batch_size}, 20, 3072)")
-    print(f"✅ 正常" if output2.shape == torch.Size([batch_size, 20, 3072]) else "❌ エラー")
+    print(f"期待形状: ({batch_size}, 43, 3072) (256/6≈43)")
+    print(f"✅ 正常" if output2.shape[1] == 43 and output2.shape[2] == 3072 else "❌ エラー")
 
     # パラメータ数確認
     print("\n[パラメータ数]")

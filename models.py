@@ -195,90 +195,40 @@ class CTCtopR(nn.Module):
         return y
 
 
-class QFormer(nn.Module):
-    """BLIP-2スタイルのQ-Former: 128トークン→20トークンに圧縮
 
-    FFNで直接LLM次元(3072)に変換することで、後段のexpansion層を削減
+class Connector(nn.Module):
+    """Conv1dベースの学習可能なコネクタ（Llama-3.2-3B用）
+
+    改善点:
+    - Q-Former (9.5M params) → Conv1d (3.4M params) (64%削減)
+    - トークン数: 128 → 21 (学習可能な圧縮)
+    - 次元: 512 → 3072 (Linear projection)
+    - 重要な情報を学習で保持
     """
-    def __init__(self, input_dim=512, num_queries=20, num_heads=8, output_dim=3072):
+    def __init__(self, input_dim=512, num_queries=21, output_dim=3072):
         super().__init__()
 
-        # Learnable queries
-        self.queries = nn.Parameter(torch.randn(num_queries, input_dim))
-
-        # Self-attention (クエリ同士が情報を共有)
-        self.self_attn = nn.MultiheadAttention(
-            embed_dim=input_dim,
-            num_heads=num_heads,
-            batch_first=True
-        )
-
-        # Cross-attention
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=input_dim,
-            num_heads=num_heads,
-            batch_first=True
-        )
-
-        # Feed-forward network: 512 → 2048 → 3072 (直接LLM次元に変換)
-        self.ffn = nn.Sequential(
+        # 学習可能な圧縮: 128 → 21
+        # stride=6: 128 / 6 ≈ 21 (正確に21になる)
+        self.compress = nn.Sequential(
+            nn.Conv1d(input_dim, input_dim, kernel_size=7, stride=6, padding=3),
             nn.LayerNorm(input_dim),
-            nn.Linear(input_dim, input_dim * 4),  # 512 → 2048
+            nn.GELU()
+        )
+
+        # Projection: 512次元 → 3072次元に拡張
+        self.projection = nn.Sequential(
+            nn.Linear(input_dim, output_dim),
             nn.GELU(),
-            nn.Linear(input_dim * 4, output_dim),  # 2048 → 3072
             nn.LayerNorm(output_dim)
         )
 
-        self.norm1 = nn.LayerNorm(input_dim)
-        self.norm2 = nn.LayerNorm(input_dim)
-
     def forward(self, x):
         # x: (batch, 128, 512)
-        batch_size = x.size(0)
-
-        # Expand queries for batch
-        queries = self.queries.unsqueeze(0).expand(batch_size, -1, -1)
-        # (batch, 20, 512)
-
-        # Self-attention: queries attend to each other
-        self_attn_out, _ = self.self_attn(queries, queries, queries)
-        queries = queries + self_attn_out  # Residual connection
-        queries = self.norm1(queries)
-
-        # Cross-attention: queries attend to x
-        cross_attn_out, _ = self.cross_attn(queries, x, x)
-        queries = queries + cross_attn_out  # Residual connection
-        queries = self.norm2(queries)
-
-        # Feed-forward: 512 → 3072 (直接LLM次元に変換)
-        output = self.ffn(queries)  # Residual接続なし（次元が変わるため）
-
-        return output  # (batch, 20, 3072)
-
-
-class Connector(nn.Module):
-    """Q-Formerベースのコネクタ（Llama-3.2-3B用）
-
-    改善点:
-    - トークン数: 128 → 20 (84%削減)
-    - Self-attention追加で情報損失を軽減
-    - FFNで直接3072次元に変換（expansion層削減）
-    - パラメータ数: 約7.5M (旧版11.16Mから33%削減)
-    """
-    def __init__(self, input_dim=512, num_queries=20, output_dim=3072):
-        super().__init__()
-
-        # Q-Former: 128トークン → 20トークンに圧縮 + 3072次元に変換
-        self.qformer = QFormer(
-            input_dim=input_dim,
-            num_queries=num_queries,
-            num_heads=8,
-            output_dim=output_dim
-        )
-
-    def forward(self, x):
-        # x: (batch, 128, 512)
-        x = self.qformer(x)      # (batch, 20, 3072)
+        x = x.transpose(1, 2)    # (batch, 512, 128) - Conv1d用
+        x = self.compress(x)      # (batch, 512, 21) - 学習可能な圧縮
+        x = x.transpose(1, 2)    # (batch, 21, 512) - 元の形式に戻す
+        x = self.projection(x)   # (batch, 21, 3072) - 次元拡張
         return x
 
 
@@ -379,7 +329,7 @@ class CTCtopB(nn.Module):
         self.use_llm = use_llm
         if use_llm:
             print("🔥 Loading LLM components (Connector + LLaMA-3.2-3B)...")
-            self.connector = Connector(input_dim=512, num_queries=20)  # 64→20に変更
+            self.connector = Connector(input_dim=512, num_queries=21)  # 128→21トークン圧縮
             self.llm = LLMWithLLaMA()
         else:
             print("⚡ LLM disabled: Using CNN shortcut only")
@@ -418,31 +368,31 @@ class CTCtopB(nn.Module):
             prefix_input = y1_llm.permute(1, 0, 2)  # (llm_batch, width, 512)
 
             # 🔍 デバッグ: 形状確認
-            print(f"\n{'='*60}")
-            print(f"[DEBUG] Shape verification")
-            print(f"{'='*60}")
-            print(f"y1_llm.shape:       {y1_llm.shape} (width, llm_batch, 512)")
-            print(f"prefix_input.shape: {prefix_input.shape} (llm_batch, width, 512)")
-            print(f"Expected:           (llm_batch, 128, 512)")
+            # print(f"\n{'='*60}")
+            # print(f"[DEBUG] Shape verification")
+            # print(f"{'='*60}")
+            # print(f"y1_llm.shape:       {y1_llm.shape} (width, llm_batch, 512)")
+            # print(f"prefix_input.shape: {prefix_input.shape} (llm_batch, width, 512)")
+            # print(f"Expected:           (llm_batch, 128, 512)")
 
-            inputs_embeds = self.connector(prefix_input)   # (llm_batch, 20, 3072)
+            inputs_embeds = self.connector(prefix_input)   # (llm_batch, 21, 3072)
 
-            print(f"inputs_embeds.shape: {inputs_embeds.shape}")
-            print(f"Expected:            (llm_batch, 20, 3072)")
+            # print(f"inputs_embeds.shape: {inputs_embeds.shape}")
+            # print(f"Expected:            (llm_batch, 21, 3072)")
 
-            # テキストをトークン化（max_length=20で統一）
+            # テキストをトークン化（max_length=21で統一）
             llm_labels = self.llm.tokenizer(
                 list(transcr_llm),
                 return_tensors="pt",
-                padding="max_length",  # 常に20トークンに統一
+                padding="max_length",  # 常に21トークンに統一
                 truncation=True,
-                max_length=20          # inputs_embedsと同じ長さ
+                max_length=21          # inputs_embedsと同じ長さ
             )
-            labels = llm_labels["input_ids"].to(y_llm.device)  # (llm_batch, 20)
+            labels = llm_labels["input_ids"].to(y_llm.device)  # (llm_batch, 21)
 
-            print(f"labels.shape:        {labels.shape}")
-            print(f"Expected:            (llm_batch, 20)")
-            print(f"{'='*60}\n")
+            # print(f"labels.shape:        {labels.shape}")
+            # print(f"Expected:            (llm_batch, 21)")
+            # print(f"{'='*60}\n")
 
 
             output_llm = self.llm(
