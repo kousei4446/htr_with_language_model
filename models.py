@@ -30,9 +30,60 @@ class BasicBlock(nn.Module):
 
 
 
-class CNN(nn.Module):
+class MobileViTBlock(nn.Module):
+    def __init__(self, in_channels, d_model=80, heads=8, num_layers=1,
+                 mlp_dim=160, patch=4):   # ← 正方パッチ4 or 8
+        super().__init__()
+        self.p = patch
+
+        self.local = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(in_channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(in_channels, d_model, 1, bias=False),
+            nn.BatchNorm2d(d_model),
+            nn.SiLU(inplace=True),
+        )
+
+        enc = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=heads, dim_feedforward=mlp_dim,
+            dropout=0.0, activation='gelu', batch_first=False, norm_first=True
+        )
+        self.transformer = nn.TransformerEncoder(enc, num_layers=num_layers)
+
+        self.fusion = nn.Sequential(
+            nn.Conv2d(d_model + in_channels, in_channels, 1, bias=False),
+            nn.BatchNorm2d(in_channels),
+            nn.SiLU(inplace=True),
+        )
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        p = self.p
+        # 128x1024固定なら常に真。可変入力が来たら早期に落とす。
+        assert (H % p == 0) and (W % p == 0), f"H,W must be multiples of {p}"
+
+        y = self.local(x)  # (B, d, H, W)
+        B, d, H, W = y.shape
+        Hp, Wp = H // p, W // p
+
+        # (B,d,H,W) -> (p*p, B*Hp*Wp, d)
+        y = y.view(B, d, Hp, p, Wp, p).permute(3, 5, 0, 2, 4, 1).contiguous()
+        y = y.view(p*p, B*Hp*Wp, d)
+
+        y = self.transformer(y)
+
+        # back to (B,d,H,W)
+        y = y.view(p, p, B, Hp, Wp, d).permute(2, 5, 3, 0, 4, 1).contiguous()
+        y = y.view(B, d, H, W)
+
+        out = torch.cat([x, y], dim=1)
+        out = self.fusion(out)
+        return out
+
+class HybridBackboneCRNNMobileViT(nn.Module):
     def __init__(self, cnn_cfg, flattening='maxpool'):
-        super(CNN, self).__init__()
+        super(HybridBackboneCRNNMobileViT, self).__init__()
 
         self.k = 1
         self.flattening = flattening
@@ -40,12 +91,23 @@ class CNN(nn.Module):
         self.features = nn.ModuleList([nn.Conv2d(1, 32, 7, [4, 2], 3), nn.ReLU()])
         in_channels = 32
         cntm = 0
+        cntv = 1
         cnt = 1
 
         for m in cnn_cfg:
             if m == 'M':
                 self.features.add_module('mxp' + str(cntm), nn.MaxPool2d(kernel_size=2, stride=2))
                 cntm += 1
+            elif isinstance(m, str) and m.startswith("mobilevit"):
+                if m == "mobilevit1":
+                    self.features.add_module(f'mvit{cntv}',
+                        MobileViTBlock(64,  d_model=80, heads=8, num_layers=1, mlp_dim=160, patch=4))
+                elif m == "mobilevit2":
+                    self.features.add_module(f'mvit{cntv}',
+                        MobileViTBlock(128, d_model=80, heads=8, num_layers=1, mlp_dim=160, patch=8))
+                else:
+                    raise ValueError(f"unknown mobilevit tag: {m}")
+                cntv += 1
             else:
                 for i in range(int(m[0])):
                     x = int(m[1])
@@ -111,31 +173,35 @@ class CTCtopR(nn.Module):
 
         return y
 
+
+    
 class CTCtopB(nn.Module):
-    def __init__(self, input_size, rnn_cfg, nclasses, rnn_type='gru'):
+    def __init__(self, input_size, rnn_cfg, nclasses, rnn_type='gru',d_llm=512, enable_connector=True):
         super(CTCtopB, self).__init__()
 
         hidden, num_layers = rnn_cfg
-
-        if rnn_type == 'gru':
-            self.rec = nn.GRU(input_size, hidden, num_layers=num_layers, bidirectional=True, dropout=.2)
-        elif rnn_type == 'lstm':
-            self.rec = nn.LSTM(input_size, hidden, num_layers=num_layers, bidirectional=True, dropout=.2)
-        else:
-            print('problem! - no such rnn type is defined')
-            exit()
         
+        RNN = nn.GRU if rnn_type == 'gru' else nn.LSTM
+        
+        self.rec1 = RNN(input_size, hidden, num_layers=1, bidirectional=True, dropout=0.0)
+        
+        self.recN = None
+        if num_layers > 1:
+            self.recN = RNN(2*hidden, hidden, num_layers=num_layers-1, bidirectional=True, dropout=.2)
+            
         self.fnl = nn.Sequential(nn.Dropout(.5), nn.Linear(2 * hidden, nclasses))
 
         self.cnn = nn.Sequential(nn.Dropout(.5), 
                                  nn.Conv2d(input_size, nclasses, kernel_size=(1, 3), stride=1, padding=(0, 1))
         )
-
+        
+        
     def forward(self, x):
 
         y = x.permute(2, 3, 0, 1)[0]
-        y = self.rec(y)[0]
-
+        y1 = self.rec1(y)[0]
+            
+        y = self.recN(y1)[0]
         y = self.fnl(y)
 
         if self.training:
@@ -155,7 +221,7 @@ class HTRNet(nn.Module):
             self.stn = None
 
         cnn_cfg = arch_cfg.cnn_cfg
-        self.features = CNN(arch_cfg.cnn_cfg, flattening=arch_cfg.flattening)
+        self.features = HybridBackboneCRNNMobileViT(arch_cfg.cnn_cfg, flattening=arch_cfg.flattening)
 
         if arch_cfg.flattening=='maxpool' or arch_cfg.flattening=='avgpool':
             hidden = cnn_cfg[-1][-1]
@@ -181,3 +247,6 @@ class HTRNet(nn.Module):
         y = self.top(y)
 
         return y
+    
+    
+    
