@@ -29,8 +29,8 @@ train:
   batch_size: 32
   scheduler: 'mstep'  # right now only 'mstep' is supported, i.e. multistep
   save_every_k_epochs: 50
-  num_workers: 8
-  use_llm: true  # Enable LLM-based learning (true/false)
+  num_workers: 3
+  use_llm: false  # Enable LLM-based learning (true/false)
   llm_sample_ratio: 0.125  # 1/8 of samples per batch use LLM (only when use_llm=true)
 
 # evaluation

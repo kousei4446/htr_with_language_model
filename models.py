@@ -205,16 +205,8 @@ class Connector(nn.Module):
     - 次元: 512 → 3072 (Linear projection)
     - 重要な情報を学習で保持
     """
-    def __init__(self, input_dim=512, num_queries=21, output_dim=3072):
+    def __init__(self, input_dim=512, num_queries=128, output_dim=3072):
         super().__init__()
-
-        # 学習可能な圧縮: 128 → 21
-        # stride=6: 128 / 6 ≈ 21 (正確に21になる)
-        self.compress = nn.Sequential(
-            nn.Conv1d(input_dim, input_dim, kernel_size=7, stride=6, padding=3),
-            nn.LayerNorm(input_dim),
-            nn.GELU()
-        )
 
         # Projection: 512次元 → 3072次元に拡張
         self.projection = nn.Sequential(
@@ -224,11 +216,7 @@ class Connector(nn.Module):
         )
 
     def forward(self, x):
-        # x: (batch, 128, 512)
-        x = x.transpose(1, 2)    # (batch, 512, 128) - Conv1d用
-        x = self.compress(x)      # (batch, 512, 21) - 学習可能な圧縮
-        x = x.transpose(1, 2)    # (batch, 21, 512) - 元の形式に戻す
-        x = self.projection(x)   # (batch, 21, 3072) - 次元拡張
+        x = self.projection(x)   # (batch, 128, 3072) - 次元拡張
         return x
 
 
@@ -271,7 +259,7 @@ class LLMWithLLaMA(nn.Module):
         print(f"✅ Model loaded successfully!")
         print(f"   Hidden size: {self.config.hidden_size}")
         print(f"   Vocab size: {self.config.vocab_size}")
-        print(f"   Initial device: CPU (will move to GPU with net.to(device))")
+        print(f"   Initial device: CPU (will move to GPU with net.to(device))") 
 
         # LLMパラメータを凍結（学習対象外にする）
         self.model.requires_grad_(False)
@@ -329,7 +317,7 @@ class CTCtopB(nn.Module):
         self.use_llm = use_llm
         if use_llm:
             print("🔥 Loading LLM components (Connector + LLaMA-3.2-3B)...")
-            self.connector = Connector(input_dim=512, num_queries=21)  # 128→21トークン圧縮
+            self.connector = Connector(input_dim=512, num_queries=128)  # 128→21トークン圧縮
             self.llm = LLMWithLLaMA()
         else:
             print("⚡ LLM disabled: Using CNN shortcut only")
