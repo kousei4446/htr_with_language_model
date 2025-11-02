@@ -280,7 +280,7 @@ class HTRTrainer(nn.Module):
                     llm_loss_raw = self.lail_loss(llm_output)
                     if llm_loss_raw.item() > 0:
                         llm_weight = 1.0 / llm_ratio
-                        llm_loss_val = (llm_loss_raw * llm_weight)*10
+                        llm_loss_val = (llm_loss_raw * llm_weight)*0.05
                         loss_val += llm_loss_val
                         # LLM損失トラッカーに記録
                         self.llm_tracker.update(llm_loss_val.item())

@@ -211,8 +211,8 @@ class Connector(nn.Module):
         # 学習可能な圧縮: 128 → 21
         # stride=6: 128 / 6 ≈ 21 (正確に21になる)
         self.compress = nn.Sequential(
-            nn.Conv1d(input_dim, input_dim, kernel_size=7, stride=6, padding=3),
-            nn.LayerNorm(input_dim),
+            nn.Conv1d(input_dim, input_dim, kernel_size=8, stride=6, padding=1),
+            nn.BatchNorm1d(input_dim),  # Conv1d用の正規化
             nn.GELU()
         )
 
