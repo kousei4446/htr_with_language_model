@@ -131,8 +131,9 @@ class HTRTrainer(nn.Module):
 
         # use_llm フラグを取得（デフォルト: True）
         use_llm = config.train.get('use_llm', True)
+        llm_source = config.train.get('llm_source', 'rnn')
 
-        net = HTRNet(config.arch, len(classes) + 1, use_llm=use_llm)
+        net = HTRNet(config.arch, len(classes) + 1, use_llm=use_llm, llm_source=llm_source)
         
         if config.resume is not None:
             _ = init_from_stage1(net, config.resume) 
@@ -248,17 +249,17 @@ class HTRTrainer(nn.Module):
                     transcr_llm = [transcr[i] for i in indices]
 
                     # モデル呼び出し（全サンプル + LLM用サンプル）
-                    output, aux_output, llm_output = self.net(
+                    output, aux_output, llm_out_rnn, llm_out_mv1, llm_out_mv2 = self.net(
                         img, img_llm=img_llm, transcr_llm=transcr_llm
                     )
                 else:
                     # LLM無効: CNN shortcut のみ使用
-                    output, aux_output, llm_output = self.net(
+                    output, aux_output, llm_out_rnn, llm_out_mv1, llm_out_mv2 = self.net(
                         img, img_llm=None, transcr_llm=None
                     )
             else:
                 output = self.net(img)
-                aux_output, llm_output = None, None
+                aux_output, llm_out_rnn, llm_out_mv1, llm_out_mv2 = None, None, None, None
 
             act_lens = torch.LongTensor(img.size(0)*[output.size(0)]).to(device)
 
@@ -277,15 +278,37 @@ class HTRTrainer(nn.Module):
 
                 # LLM損失（use_llm=true の場合のみ計算）
                 if use_llm:
-                    llm_loss_raw = self.lail_loss(llm_output)
-                    if llm_loss_raw.item() > 0:
-                        llm_weight = 1.0 / llm_ratio
-                        llm_loss_val = (llm_loss_raw * llm_weight)*10
-                        loss_val += llm_loss_val
-                        # LLM損失トラッカーに記録
-                        self.llm_tracker.update(llm_loss_val.item())
-                    else:
-                        # LLM損失が計算されなかった
+                    llm_weights = config.train.get('llm_loss_weights', {
+                        'rnn': 1.0, 'mobilevit1': 0.5, 'mobilevit2': 0.5
+                    })
+
+                    # RNN経路のLLM損失
+                    if llm_out_rnn is not None:
+                        llm_loss_rnn = self.lail_loss(llm_out_rnn) * llm_weights['rnn']
+                        if llm_loss_rnn.item() > 0:
+                            llm_loss_val = (llm_loss_rnn * (1.0 / llm_ratio)) * 10
+                            loss_val += llm_loss_val
+                            self.llm_tracker.update(llm_loss_val.item())
+                            self.logger.epoch_losses['llm_rnn'].append(llm_loss_val.item())
+
+                    # MobileViT1経路のLLM損失
+                    if llm_out_mv1 is not None:
+                        llm_loss_mv1 = self.lail_loss(llm_out_mv1) * llm_weights['mobilevit1']
+                        if llm_loss_mv1.item() > 0:
+                            llm_loss_val_mv1 = (llm_loss_mv1 * (1.0 / llm_ratio)) * 10
+                            loss_val += llm_loss_val_mv1
+                            self.logger.epoch_losses['llm_mv1'].append(llm_loss_val_mv1.item())
+
+                    # MobileViT2経路のLLM損失
+                    if llm_out_mv2 is not None:
+                        llm_loss_mv2 = self.lail_loss(llm_out_mv2) * llm_weights['mobilevit2']
+                        if llm_loss_mv2.item() > 0:
+                            llm_loss_val_mv2 = (llm_loss_mv2 * (1.0 / llm_ratio)) * 10
+                            loss_val += llm_loss_val_mv2
+                            self.logger.epoch_losses['llm_mv2'].append(llm_loss_val_mv2.item())
+
+                    # LLM損失が計算されなかった場合
+                    if llm_out_rnn is None and llm_out_mv1 is None and llm_out_mv2 is None:
                         self.llm_tracker.update(None)
 
             tloss_val = loss_val.item()
@@ -298,8 +321,7 @@ class HTRTrainer(nn.Module):
             self.logger.epoch_losses['ctc'].append(ctc_loss_val.item())
             if aux_loss_val is not None:
                 self.logger.epoch_losses['aux'].append(aux_loss_val.item())
-            if llm_loss_val is not None:
-                self.logger.epoch_losses['llm'].append(llm_loss_val.item())
+            # LLM損失は各経路ごとに上記で記録済み
 
             t.set_postfix(values='loss : {:.2f}'.format(tloss_val))
 

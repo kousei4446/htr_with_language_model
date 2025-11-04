@@ -136,17 +136,30 @@ class HybridBackboneCRNNMobileViT(nn.Module):
                     in_channels = x
                     cnt += 1
 
-    def forward(self, x, reduce='max'):
+    def forward(self, x, reduce='max', return_mobilevit=False):
 
         y = x
+        mobilevit1_output = None  # MobileViT1層の出力を保存
+        mobilevit2_output = None  # MobileViT2層の出力を保存
+
         for i, nn_module in enumerate(self.features):
             y = nn_module(y)
+            # 各MobileViT層の出力を保存
+            if isinstance(nn_module, MobileViTBlock):
+                # モジュール名を取得してどのMobileViT層か判定
+                module_name = list(self.features._modules.keys())[i]
+                if 'mvit1' in module_name:
+                    mobilevit1_output = y
+                elif 'mvit2' in module_name:
+                    mobilevit2_output = y
 
         if self.flattening=='maxpool':
             y = F.max_pool2d(y, [y.size(2), self.k], stride=[y.size(2), 1], padding=[0, self.k//2])
         elif self.flattening=='concat':
             y = y.view(y.size(0), -1, 1, y.size(3))
 
+        if return_mobilevit:
+            return y, mobilevit1_output, mobilevit2_output
         return y
 
 def weight_init(m):
@@ -207,17 +220,71 @@ class Connector(nn.Module):
     """
     def __init__(self, input_dim=512, output_dim=3072):
         super().__init__()
-
         # Projection: 512次元 → 3072次元に拡張
         self.projection = nn.Sequential(
+            nn.LayerNorm(input_dim),
             nn.Linear(input_dim, output_dim),
             nn.GELU(),
-            nn.LayerNorm(output_dim)
         )
 
     def forward(self, x):
-
         x = self.projection(x)   # (batch, 128, 3072) - 次元拡張
+        return x
+
+
+class ConnectorMobileViT1(nn.Module):
+    """MobileViT1出力用のConnector (64次元 → 3072次元)
+
+    入力: (batch, 64, H, W) - mobilevit1層の出力
+    出力: (batch, seq_len, 3072) - LLM用の埋め込み
+
+    パラメータ数: 約1.9M
+    - 64 → 512: 33K params
+    - 512 → 3072: 1.6M params
+    """
+    def __init__(self, input_dim=64, output_dim=3072):
+        super().__init__()
+        # Projection: 64 → 512 → 3072
+        self.projection = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, output_dim),
+            nn.GELU(),
+        )
+
+    def forward(self, x):
+        # x: (batch, 64, H, W)
+        B, C, H, W = x.shape
+        x = x.view(B, C, -1)  # (batch, 64, H*W)
+        x = x.permute(0, 2, 1)  # (batch, H*W, 64)
+        x = self.projection(x)  # (batch, H*W, 3072)
+        return x
+
+
+class ConnectorMobileViT2(nn.Module):
+    """MobileViT2出力用のConnector (128次元 → 3072次元)
+
+    入力: (batch, 128, H, W) - mobilevit2層の出力
+    出力: (batch, seq_len, 3072) - LLM用の埋め込み
+
+    パラメータ数: 約2.2M
+    - 128 → 512: 66K params
+    - 512 → 3072: 1.6M params
+    """
+    def __init__(self, input_dim=128, output_dim=3072):
+        super().__init__()
+        # Projection: 128 → 512 → 3072
+        self.projection = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, output_dim),
+            nn.GELU(),
+        )
+
+    def forward(self, x):
+        # x: (batch, 128, H, W)
+        B, C, H, W = x.shape
+        x = x.view(B, C, -1)  # (batch, 128, H*W)
+        x = x.permute(0, 2, 1)  # (batch, H*W, 128)
+        x = self.projection(x)  # (batch, H*W, 3072)
         return x
 
 
@@ -292,7 +359,7 @@ class LLMWithLLaMA(nn.Module):
         
         
 class CTCtopB(nn.Module):
-    def __init__(self, input_size, rnn_cfg, nclasses, rnn_type='gru', d_llm=512, enable_connector=True, use_llm=False):
+    def __init__(self, input_size, rnn_cfg, nclasses, rnn_type='gru', d_llm=512, enable_connector=True, use_llm=False, llm_source='rnn'):
         super(CTCtopB, self).__init__()
 
         hidden, num_layers = rnn_cfg
@@ -316,21 +383,46 @@ class CTCtopB(nn.Module):
 
         # LLM使用時のみ Connector と LLM をロード
         self.use_llm = use_llm
+        self.llm_source = llm_source  # 'rnn', 'mobilevit1', 'mobilevit2', 'all'
+
         if use_llm:
-            print("🔥 Loading LLM components (Connector + LLaMA-3.2-3B)...")
-            self.connector = Connector(input_dim=512)
+            # ✅ LLMは1つだけ作成（共有）
+            print("🔥 Loading shared LLM (LLaMA-3.2-3B)...")
             self.llm = LLMWithLLaMA()
+
+            # ✅ Connectorは個別に作成（学習可能パラメータ）
+            if 'rnn' in llm_source or llm_source == 'all':
+                print("   - Loading Connector_RNN (512→3072)...")
+                self.connector_rnn = Connector(input_dim=512)
+            else:
+                self.connector_rnn = None
+
+            if 'mobilevit1' in llm_source or llm_source == 'all':
+                print("   - Loading Connector_MV1 (64→3072)...")
+                self.connector_mv1 = ConnectorMobileViT1(input_dim=64)
+            else:
+                self.connector_mv1 = None
+
+            if 'mobilevit2' in llm_source or llm_source == 'all':
+                print("   - Loading Connector_MV2 (128→3072)...")
+                self.connector_mv2 = ConnectorMobileViT2(input_dim=128)
+            else:
+                self.connector_mv2 = None
         else:
             print("⚡ LLM disabled: Using CNN shortcut only")
-            self.connector = None
             self.llm = None
+            self.connector_rnn = None
+            self.connector_mv1 = None
+            self.connector_mv2 = None
         
         
-    def forward(self, x, y_llm=None, transcr_llm=None):
+    def forward(self, x, y_llm=None, mv1_llm=None, mv2_llm=None, transcr_llm=None):
         """
         Args:
             x: 全サンプルの特徴量 (batch_size, 256, 1, width)
-            y_llm: LLM用サンプルの特徴量 (llm_batch_size, 256, 1, width)
+            y_llm: RNN用LLMサンプルの特徴量 (llm_batch_size, 256, 1, width)
+            mv1_llm: MobileViT1用LLMサンプルの出力 (llm_batch_size, 64, H1, W1)
+            mv2_llm: MobileViT2用LLMサンプルの出力 (llm_batch_size, 128, H2, W2)
             transcr_llm: LLM用の正解文字列 (llm_batch_size,)
         """
         # RNN処理（全サンプル）
@@ -346,57 +438,85 @@ class CTCtopB(nn.Module):
         # Final CTC projection
         y_ctc = self.fnl(y_rnn)  # (width, batch, nclasses)
 
-        # LLM処理（use_llm=true かつ 選択されたサンプルのみ）
-        output_llm = None
-        if self.use_llm and y_llm is not None and transcr_llm is not None and self.training:
-            # y_llmからRNN layer1の出力を取得（as per model_structure.md）
-            y_llm_seq = y_llm.permute(2, 3, 0, 1)[0]  # (width, llm_batch, 256)
-            y1_llm = self.rec1(y_llm_seq)[0]  # (width, llm_batch, 512) - layer1 output only
+        # ✅ LLM処理（逐次実行で1つのLLMを共有）
+        output_llm_rnn = None
+        output_llm_mv1 = None
+        output_llm_mv2 = None
 
-            # Connectorで3072次元に変換 (Llama-3.2-3B用)
-            prefix_input = y1_llm.permute(1, 0, 2)  # (llm_batch, width, 512)
+        if self.use_llm and transcr_llm is not None and self.training:
+            # RNN経路（順番1）
+            if self.connector_rnn is not None and y_llm is not None:
+                # y_llmからRNN layer1の出力を取得
+                y_llm_seq = y_llm.permute(2, 3, 0, 1)[0]  # (width, llm_batch, 256)
+                y1_llm = self.rec1(y_llm_seq)[0]  # (width, llm_batch, 512) - layer1 output only
 
-            # 🔍 デバッグ: 形状確認
-            # print(f"\n{'='*60}")
-            # print(f"[DEBUG] Shape verification")
-            # print(f"{'='*60}")
-            # print(f"y1_llm.shape:       {y1_llm.shape} (width, llm_batch, 512)")
-            # print(f"prefix_input.shape: {prefix_input.shape} (llm_batch, width, 512)")
-            # print(f"Expected:           (llm_batch, 128, 512)")
+                # Connectorで3072次元に変換
+                prefix_input = y1_llm.permute(1, 0, 2)  # (llm_batch, width, 512)
+                inputs_embeds = self.connector_rnn(prefix_input)   # (llm_batch, width, 3072)
 
-            inputs_embeds = self.connector(prefix_input)   # (llm_batch,128, 3072)
+                # テキストをトークン化
+                llm_labels = self.llm.tokenizer(  # ✅ 共有LLM
+                    list(transcr_llm),
+                    return_tensors="pt",
+                    padding="max_length",
+                    truncation=True,
+                    max_length=inputs_embeds.shape[1]
+                )
+                labels = llm_labels["input_ids"].to(y_llm.device)
 
-            # print(f"inputs_embeds.shape: {inputs_embeds.shape}")
-            # print(f"Expected:            (llm_batch, 21, 3072)")
+                output_llm_rnn = self.llm(  # ✅ 共有LLM
+                    inputs_embeds=inputs_embeds.half(),
+                    labels=labels
+                )
 
-            # テキストをトークン化（max_length=21で統一）
-            llm_labels = self.llm.tokenizer(
-                list(transcr_llm),
-                return_tensors="pt",
-                padding="max_length",
-                truncation=True,
-                max_length=inputs_embeds.shape[1]  # Connector出力の長さに合わせる
-            )
-            labels = llm_labels["input_ids"].to(y_llm.device)  # (llm_batch, 128)
+            # MobileViT1経路（順番2）
+            if self.connector_mv1 is not None and mv1_llm is not None:
+                # MobileViT1出力をConnectorで変換
+                inputs_embeds = self.connector_mv1(mv1_llm)  # (llm_batch, H1*W1, 3072)
 
-            # print(f"labels.shape:        {labels.shape}")
-            # print(f"Expected:            (llm_batch, 128)")
-            # print(f"{'='*60}\n")
+                # テキストをトークン化
+                llm_labels = self.llm.tokenizer(  
+                    list(transcr_llm),
+                    return_tensors="pt",
+                    padding="max_length",
+                    truncation=True,
+                    max_length=inputs_embeds.shape[1]
+                )
+                labels = llm_labels["input_ids"].to(mv1_llm.device)
 
+                output_llm_mv1 = self.llm(  
+                    inputs_embeds=inputs_embeds.half(),
+                    labels=labels
+                )
 
-            output_llm = self.llm(
-                inputs_embeds=inputs_embeds.half(),  # (batch, 128, 3072) float16に変換
-                labels=labels                         # (batch, 128) ← 長さ一致！
-            )
+            # MobileViT2経路（順番3）
+            if self.connector_mv2 is not None and mv2_llm is not None:
+                # MobileViT2出力をConnectorで変換
+                inputs_embeds = self.connector_mv2(mv2_llm)  # (llm_batch, H2*W2, 3072)
+
+                # テキストをトークン化
+                llm_labels = self.llm.tokenizer(  
+                    list(transcr_llm),
+                    return_tensors="pt",
+                    padding="max_length",
+                    truncation=True,
+                    max_length=inputs_embeds.shape[1]
+                )
+                labels = llm_labels["input_ids"].to(mv2_llm.device)
+
+                output_llm_mv2 = self.llm(  
+                    inputs_embeds=inputs_embeds.half(),
+                    labels=labels
+                )
 
         if self.training:
-            return y_ctc, self.cnn(x).permute(2, 3, 0, 1)[0], output_llm
+            return y_ctc, self.cnn(x).permute(2, 3, 0, 1)[0], output_llm_rnn, output_llm_mv1, output_llm_mv2
         else:
             return y_ctc, self.cnn(x).permute(2, 3, 0, 1)[0]
 
 
 class HTRNet(nn.Module):
-    def __init__(self, arch_cfg, nclasses, use_llm=False):
+    def __init__(self, arch_cfg, nclasses, use_llm=False, llm_source='rnn'):
         super(HTRNet, self).__init__()
 
         if arch_cfg.stn:
@@ -415,13 +535,15 @@ class HTRNet(nn.Module):
         else:
             print('problem! - no such flattening is defined')
 
+        self.llm_source = llm_source  # 'rnn', 'mobilevit1', 'mobilevit2', 'all'
+
         head = arch_cfg.head_type
         if head=='cnn':
             self.top = CTCtopC(hidden, nclasses)
         elif head=='rnn':
             self.top = CTCtopR(hidden, (arch_cfg.rnn_hidden_size, arch_cfg.rnn_layers), nclasses, rnn_type=arch_cfg.rnn_type)
         elif head=='both':
-            self.top = CTCtopB(hidden, (arch_cfg.rnn_hidden_size, arch_cfg.rnn_layers), nclasses, rnn_type=arch_cfg.rnn_type, use_llm=use_llm)
+            self.top = CTCtopB(hidden, (arch_cfg.rnn_hidden_size, arch_cfg.rnn_layers), nclasses, rnn_type=arch_cfg.rnn_type, use_llm=use_llm, llm_source=llm_source)
 
     def forward(self, x, img_llm=None, transcr_llm=None):
         """
@@ -437,14 +559,26 @@ class HTRNet(nn.Module):
 
         # LLM用サンプルの特徴量抽出
         y_llm = None
+        mv1_llm = None
+        mv2_llm = None
+
         if img_llm is not None:
             if self.stn is not None:
                 img_llm = self.stn(img_llm)
-            y_llm = self.features(img_llm)
+
+            # MobileViT出力が必要か判定
+            need_mv = ('mobilevit1' in self.llm_source or
+                      'mobilevit2' in self.llm_source or
+                      self.llm_source == 'all')
+
+            if need_mv:
+                y_llm, mv1_llm, mv2_llm = self.features(img_llm, return_mobilevit=True)
+            else:
+                y_llm = self.features(img_llm)
 
         # CTCtopBに渡す
         if transcr_llm is not None:
-            y = self.top(y, y_llm=y_llm, transcr_llm=transcr_llm)
+            y = self.top(y, y_llm=y_llm, mv1_llm=mv1_llm, mv2_llm=mv2_llm, transcr_llm=transcr_llm)
         else:
             y = self.top(y)
 
