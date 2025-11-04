@@ -73,7 +73,7 @@ class HTREval(nn.Module):
         if config.resume is not None:
             # print('resuming from checkpoint: {}'.format(config.resume))
             load_dict = torch.load(config.resume)
-            load_status = net.load_state_dict(load_dict, strict=False)
+            load_status = net.load_state_dict(load_dict, strict=True)
             # print(load_status)
         net.to(device)
 

@@ -77,15 +77,14 @@ print("\n🔧 Creating model with LLM enabled...")
 net = HTRNet(config.arch, len(classes) + 1, use_llm=True)
 
 # 学習済み重みをロード（親ディレクトリから）
-model_file = '50.pt'  # 700 epochモデルを使用
 model_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                          'saved_models', '10-30_llmmobilevit', model_file)
+                          'saved_models', '10-30_llmmobilevit', '700.pt')
 print(f"\n📥 Loading checkpoint: {model_path}")
 load_dict = torch.load(model_path, map_location='cpu')
 missing_keys, unexpected_keys = net.load_state_dict(load_dict, strict=True)
 
 print(f"✅ Loaded checkpoint successfully")
-print(f"   Model: 10-30_llmmobilevit/{model_file} (trained with LLM)")
+print(f"   Model: 10-30_llmmobilevit/700.pt (trained with LLM)")
 if missing_keys:
     print(f"   Missing keys: {len(missing_keys)}")
 if unexpected_keys:
@@ -187,7 +186,7 @@ print(f"📊 Images saved to: {results_dir}")
 print(f"{'='*80}")
 
 print("\n💡 Note:")
-print(f"   - 学習済みモデル（{model_file} epoch, LLM込み）を使用")
+print("   - 学習済みモデル（700 epoch, LLM込み）を使用")
 print("   - CTC: 従来のCTCデコーダの出力")
 print("   - LLM: Connectorを通してLLMで生成した出力")
 print("   - 両者の精度を比較できます")

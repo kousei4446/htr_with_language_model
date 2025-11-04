@@ -205,7 +205,7 @@ class Connector(nn.Module):
     - 次元: 512 → 3072 (Linear projection)
     - 重要な情報を学習で保持
     """
-    def __init__(self, input_dim=512, num_queries=128, output_dim=3072):
+    def __init__(self, input_dim=512, output_dim=3072):
         super().__init__()
 
         # Projection: 512次元 → 3072次元に拡張
@@ -216,6 +216,7 @@ class Connector(nn.Module):
         )
 
     def forward(self, x):
+
         x = self.projection(x)   # (batch, 128, 3072) - 次元拡張
         return x
 
@@ -259,7 +260,7 @@ class LLMWithLLaMA(nn.Module):
         print(f"✅ Model loaded successfully!")
         print(f"   Hidden size: {self.config.hidden_size}")
         print(f"   Vocab size: {self.config.vocab_size}")
-        print(f"   Initial device: CPU (will move to GPU with net.to(device))") 
+        print(f"   Initial device: CPU (will move to GPU with net.to(device))")
 
         # LLMパラメータを凍結（学習対象外にする）
         self.model.requires_grad_(False)
@@ -317,7 +318,7 @@ class CTCtopB(nn.Module):
         self.use_llm = use_llm
         if use_llm:
             print("🔥 Loading LLM components (Connector + LLaMA-3.2-3B)...")
-            self.connector = Connector(input_dim=512, num_queries=128)  # 128→21トークン圧縮
+            self.connector = Connector(input_dim=512)
             self.llm = LLMWithLLaMA()
         else:
             print("⚡ LLM disabled: Using CNN shortcut only")
@@ -363,7 +364,7 @@ class CTCtopB(nn.Module):
             # print(f"prefix_input.shape: {prefix_input.shape} (llm_batch, width, 512)")
             # print(f"Expected:           (llm_batch, 128, 512)")
 
-            inputs_embeds = self.connector(prefix_input)   # (llm_batch, 21, 3072)
+            inputs_embeds = self.connector(prefix_input)   # (llm_batch,128, 3072)
 
             # print(f"inputs_embeds.shape: {inputs_embeds.shape}")
             # print(f"Expected:            (llm_batch, 21, 3072)")
@@ -372,20 +373,20 @@ class CTCtopB(nn.Module):
             llm_labels = self.llm.tokenizer(
                 list(transcr_llm),
                 return_tensors="pt",
-                padding="max_length",  # 常に21トークンに統一
+                padding="max_length",
                 truncation=True,
-                max_length=21          # inputs_embedsと同じ長さ
+                max_length=inputs_embeds.shape[1]  # Connector出力の長さに合わせる
             )
-            labels = llm_labels["input_ids"].to(y_llm.device)  # (llm_batch, 21)
+            labels = llm_labels["input_ids"].to(y_llm.device)  # (llm_batch, 128)
 
             # print(f"labels.shape:        {labels.shape}")
-            # print(f"Expected:            (llm_batch, 21)")
+            # print(f"Expected:            (llm_batch, 128)")
             # print(f"{'='*60}\n")
 
 
             output_llm = self.llm(
-                inputs_embeds=inputs_embeds.half(),  # (batch, 20, 3072) float16に変換
-                labels=labels                         # (batch, 20) ← 長さ一致！
+                inputs_embeds=inputs_embeds.half(),  # (batch, 128, 3072) float16に変換
+                labels=labels                         # (batch, 128) ← 長さ一致！
             )
 
         if self.training:

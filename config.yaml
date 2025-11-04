@@ -42,4 +42,4 @@ eval:
 
 # model saving and logging
 model:
-  save_dir: './saved_models/10-30_llmmobilevit'
+  save_dir: './saved_models/11-04_llmmobilevit'
