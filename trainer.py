@@ -222,10 +222,15 @@ class HTRTrainer(nn.Module):
 
         self.net.train()
 
+        # 勾配累積の設定を取得（デフォルトは1 = 累積なし）
+        accumulation_steps = config.train.get('accumulation_steps', 1)
+
         t = tqdm.tqdm(self.loaders['train'])
         t.set_description('Epoch {}'.format(epoch))
         for iter_idx, (img, transcr) in enumerate(t):
-            self.optimizer.zero_grad()
+            # 勾配累積サイクルの最初だけゼロクリア
+            if iter_idx % accumulation_steps == 0:
+                self.optimizer.zero_grad()
 
             img = img.to(device)
 
@@ -313,8 +318,16 @@ class HTRTrainer(nn.Module):
 
             tloss_val = loss_val.item()
 
-            loss_val.backward()
-            self.optimizer.step()
+            # 勾配累積: 損失を累積ステップ数で正規化
+            (loss_val / accumulation_steps).backward()
+
+            # 勾配累積サイクルの最後だけ重み更新
+            if (iter_idx + 1) % accumulation_steps == 0:
+                self.optimizer.step()
+
+                # 定期的にCUDAキャッシュをクリアしてメモリ断片化を防ぐ
+                if (iter_idx + 1) % (accumulation_steps * 10) == 0:
+                    torch.cuda.empty_cache()
 
             # エポック平均計算用にバッファに保存（バッチごとのログは削除）
             self.logger.epoch_losses['total'].append(tloss_val)

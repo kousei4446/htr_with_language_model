@@ -26,13 +26,14 @@ arch:
 train:
   lr: 1e-3
   num_epochs: 800
-  batch_size: 32
+  batch_size: 8  # Reduced from 32 to prevent OOM
   scheduler: 'mstep'  # right now only 'mstep' is supported, i.e. multistep
   save_every_k_epochs: 50
   num_workers: 3
   use_llm: true  # Enable LLM-based learning (true/false)
   llm_sample_ratio: 0.0625  # 1/16 of samples per batch use LLM (only when use_llm=true)
-  llm_source: 'rnn'  # 'rnn', 'mobilevit1', 'mobilevit2', 'rnn+mobilevit1', 'rnn+mobilevit2', 'mobilevit1+mobilevit2', 'all'
+  accumulation_steps: 4  # Accumulate gradients over 4 steps to maintain effective batch size of 32
+  llm_source: 'all'  # 'rnn', 'mobilevit1', 'mobilevit2', 'rnn+mobilevit1', 'rnn+mobilevit2', 'mobilevit1+mobilevit2', 'all'
   llm_loss_weights:
     rnn: 1.0         # RNN経路のLLM損失の重み
     mobilevit1: 0.5  # MobileViT1経路のLLM損失の重み
@@ -40,7 +41,7 @@ train:
 
 # evaluation
 eval:
-  batch_size: 32
+  batch_size: 8  # Reduced from 32 to prevent OOM during evaluation
   num_workers: 8
   wer_mode: 'tokenizer' # select from 'tokenizer', 'space'
 
