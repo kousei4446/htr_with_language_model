@@ -1,4 +1,4 @@
-resume:
+resume: ./saved_models/CRNN+LLM/700.pt
 save: './temp.pt'
 
 device: 'cuda:0'
@@ -30,9 +30,9 @@ train:
   scheduler: 'mstep'  # right now only 'mstep' is supported, i.e. multistep
   save_every_k_epochs: 50
   num_workers: 3
-  use_llm: false  # Enable LLM-based learning (true/false)
+  use_llm: true  # Enable LLM-based learning (true/false)
   llm_sample_ratio: 0.0625  # 1/16 of samples per batch use LLM (only when use_llm=true)
-  llm_source: 'all'  # 'rnn', 'mobilevit1', 'mobilevit2', 'rnn+mobilevit1', 'rnn+mobilevit2', 'mobilevit1+mobilevit2', 'all'
+  llm_source: 'rnn'  # 'rnn', 'mobilevit1', 'mobilevit2', 'rnn+mobilevit1', 'rnn+mobilevit2', 'mobilevit1+mobilevit2', 'all'
   llm_loss_weights:
     rnn: 1.0         # RNN経路のLLM損失の重み
     mobilevit1: 0.5  # MobileViT1経路のLLM損失の重み

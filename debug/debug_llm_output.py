@@ -110,7 +110,7 @@ for i, idx in enumerate(indices):
     print(f"{'='*80}")
     print(f"📝 Ground Truth: '{transcr}'")
 
-    with torch.no_grad():
+    with torch.no_gra():
         # 1. 特徴量抽出
         if net.stn is not None:
             img_feat = net.stn(img)

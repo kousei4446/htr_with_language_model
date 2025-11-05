@@ -1,5 +1,7 @@
 """
-学習済みモデルのCTC出力とLLM出力を比較するスクリプト
+学習済みモデルのCTC出力とLLM出力を比較するスクリプト (新実装対応版)
+- 新しいMobileViT+LLM実装に対応
+- 旧チェックポイントも読み込み可能
 """
 import sys
 import os
@@ -44,9 +46,8 @@ dataset = HTRDataset(
     fixed_size=(config.preproc.image_height, config.preproc.image_width)
 )
 
-# 学習時の文字クラスを読み込み（saved_models/classes.npyから）
-classes_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                           'saved_models', 'classes.npy')
+# 学習時の文字クラスを読み込み（data_path/classes.npyから）
+classes_path = os.path.join(data_path, 'classes.npy')
 classes = np.load(classes_path, allow_pickle=True).tolist()
 print(f"Character classes: {len(classes)} different characters (loaded from training)")
 
@@ -74,25 +75,78 @@ def decode_ctc(tokens, char_classes):
 
 # モデル作成（LLM有効）
 print("\n🔧 Creating model with LLM enabled...")
-net = HTRNet(config.arch, len(classes) + 1, use_llm=True)
+llm_source = config.train.get('llm_source', 'rnn')
+print(f"   LLM source: {llm_source}")
+
+net = HTRNet(config.arch, len(classes) + 1, use_llm=True, llm_source=llm_source)
 
 # 学習済み重みをロード（親ディレクトリから）
-model_file = '50.pt'  # 700 epochモデルを使用
 model_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                          'saved_models', '10-30_llmmobilevit', model_file)
+                          'saved_models', 'CRNN+LLM', '700.pt')
 print(f"\n📥 Loading checkpoint: {model_path}")
+
+if not os.path.exists(model_path):
+    print(f"❌ Error: Checkpoint not found at {model_path}")
+    print("   Please update the model_path in this script")
+    sys.exit(1)
+
 load_dict = torch.load(model_path, map_location='cpu')
-missing_keys, unexpected_keys = net.load_state_dict(load_dict, strict=True)
+
+# 旧実装のLLM関連キーをフィルタリング（新実装との互換性のため）
+filtered_dict = {}
+llm_keys_filtered = 0
+
+for k, v in load_dict.items():
+    # 旧実装のキー（top.connector.*, top.llm.*）を除外
+    if k.startswith('top.connector.') or k.startswith('top.llm.'):
+        llm_keys_filtered += 1
+        continue
+    filtered_dict[k] = v
+
+print(f"   Filtered {llm_keys_filtered} LLM-related keys from checkpoint")
+
+# モデルにロード（strict=False: 新しいconnector_rnn等は初期化される）
+missing_keys, unexpected_keys = net.load_state_dict(filtered_dict, strict=True)
 
 print(f"✅ Loaded checkpoint successfully")
-print(f"   Model: 10-30_llmmobilevit/{model_file} (trained with LLM)")
+print(f"   Loaded: {len(filtered_dict)} parameters")
 if missing_keys:
-    print(f"   Missing keys: {len(missing_keys)}")
+    print(f"   Missing keys: {len(missing_keys)} (new LLM components, initialized randomly)")
 if unexpected_keys:
     print(f"   Unexpected keys: {len(unexpected_keys)}")
 
 net.to(device)
 net.eval()
+
+# Connector選択
+print("\n🔧 Selecting Connector based on llm_source...")
+connector = None
+connector_name = None
+
+if hasattr(net.top, 'connector_rnn') and net.top.connector_rnn is not None:
+    connector = net.top.connector_rnn
+    connector_name = 'RNN'
+    print(f"   Using Connector_RNN (512 → 3072)")
+elif hasattr(net.top, 'connector_mv1') and net.top.connector_mv1 is not None:
+    connector = net.top.connector_mv1
+    connector_name = 'MobileViT1'
+    print(f"   Using Connector_MV1 (64 → 3072)")
+elif hasattr(net.top, 'connector_mv2') and net.top.connector_mv2 is not None:
+    connector = net.top.connector_mv2
+    connector_name = 'MobileViT2'
+    print(f"   Using Connector_MV2 (128 → 3072)")
+else:
+    print("❌ Error: No connector available!")
+    print("   Check use_llm and llm_source in config.yaml")
+    sys.exit(1)
+
+# LLMチェック
+if not hasattr(net.top, 'llm') or net.top.llm is None:
+    print("❌ Error: LLM not available!")
+    print("   Set use_llm: true in config.yaml")
+    sys.exit(1)
+
+print(f"✅ LLM available (shared across all paths)")
 
 # サンプル画像で確認
 print("\n🔍 Testing CTC vs LLM output on sample images...\n")
@@ -122,7 +176,11 @@ for i, idx in enumerate(indices):
         # 2. RNN処理
         y_seq = y.permute(2, 3, 0, 1)[0]  # (width, 1, 256)
         y1 = net.top.rec1(y_seq)[0]  # (width, 1, 512)
-        y_rnn = net.top.recN(y1)[0]  # (width, 1, 512)
+
+        if net.top.recN is not None:
+            y_rnn = net.top.recN(y1)[0]  # (width, 1, 512)
+        else:
+            y_rnn = y1
 
         # === CTC出力 ===
         y_ctc = net.top.fnl(y_rnn)  # (width, 1, nclasses)
@@ -131,12 +189,12 @@ for i, idx in enumerate(indices):
         print(f"🔤 CTC Prediction: '{ctc_text}'")
 
         # === LLM出力 ===
-        # Connector入力準備
+        # Connector入力準備（RNN layer1出力を使用）
         prefix_input = y1.permute(1, 0, 2)  # (1, width, 512)
-        inputs_embeds = net.top.connector(prefix_input)  # (1, num_tokens, 3072)
+        inputs_embeds = connector(prefix_input)  # (1, num_tokens, 3072)
 
         seq_len = inputs_embeds.shape[1]
-        print(f"🔧 Connector output tokens: {seq_len}")
+        print(f"🔧 Connector output tokens: {seq_len} (using {connector_name} path)")
 
         # Ground Truth文字列をトークン化
         llm_labels = net.top.llm.tokenizer(
@@ -165,7 +223,7 @@ for i, idx in enumerate(indices):
     fig, ax = plt.subplots(1, 1, figsize=(15, 3))
     ax.imshow(img_display.squeeze(), cmap='gray')
     ax.set_title(
-        f"Sample {i+1} (Index: {idx})\n"
+        f"Sample {i+1} (Index: {idx}) - Using {connector_name} Connector\n"
         f"GT:  '{transcr}'\n"
         f"CTC: '{ctc_text}'\n"
         f"LLM: '{llm_text}'",
@@ -187,7 +245,8 @@ print(f"📊 Images saved to: {results_dir}")
 print(f"{'='*80}")
 
 print("\n💡 Note:")
-print(f"   - 学習済みモデル（{model_file} epoch, LLM込み）を使用")
+print("   - 新しいMobileViT+LLM実装に対応")
+print(f"   - Connector: {connector_name} path")
 print("   - CTC: 従来のCTCデコーダの出力")
 print("   - LLM: Connectorを通してLLMで生成した出力")
 print("   - 両者の精度を比較できます")
