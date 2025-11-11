@@ -4,7 +4,6 @@ import torch
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
-    LlamaForCausalLM,
 )
 from typing import List, Optional, Dict, Union
 
@@ -136,17 +135,25 @@ class HybridBackboneCRNNMobileViT(nn.Module):
                     in_channels = x
                     cnt += 1
 
-    def forward(self, x, reduce='max'):
+    def forward(self, x, reduce='max', return_mobilevit_outputs=False):
 
         y = x
+        mobilevit_outputs = []
+
         for i, nn_module in enumerate(self.features):
             y = nn_module(y)
+
+            # MobileViTBlockの出力を保存
+            if isinstance(nn_module, MobileViTBlock):
+                mobilevit_outputs.append(y)
 
         if self.flattening=='maxpool':
             y = F.max_pool2d(y, [y.size(2), self.k], stride=[y.size(2), 1], padding=[0, self.k//2])
         elif self.flattening=='concat':
             y = y.view(y.size(0), -1, 1, y.size(3))
 
+        if return_mobilevit_outputs:
+            return y, mobilevit_outputs
         return y
 
 def weight_init(m):
@@ -196,19 +203,63 @@ class CTCtopR(nn.Module):
 
 
 
-class Connector(nn.Module):
-    """Conv1dベースの学習可能なコネクタ（Llama-3.2-3B用）
+class ConnectorForMobileViT(nn.Module):
+    """MobileViT出力用のコネクタ (GPT-2 small用)
 
-    改善点:
-    - Q-Former (9.5M params) → Conv1d (3.4M params) (64%削減)
-    - トークン数: 128 → 21 (学習可能な圧縮)
-    - 次元: 512 → 3072 (Linear projection)
-    - 重要な情報を学習で保持
+    MobileViTの2D特徴マップ (H, W, C) をGPT-2の入力形式 (seq_len, hidden_size=768) に変換
     """
-    def __init__(self, input_dim=512, output_dim=3072):
+    def __init__(self, input_channels, output_dim=768):
+        """
+        Args:
+            input_channels: MobileViT出力のチャネル数 (64 or 128)
+            output_dim: GPT-2のhidden_size (768)
+        """
         super().__init__()
 
-        # Projection: 512次元 → 3072次元に拡張
+        # Spatial pooling: (B, C, H, W) → (B, C, 1, W)
+        # Height方向をmax poolingで圧縮
+        self.spatial_pool = nn.AdaptiveMaxPool2d((1, None))
+
+        # Projection: C → 768
+        self.projection = nn.Sequential(
+            nn.Linear(input_channels, output_dim),
+            nn.GELU(),
+            nn.LayerNorm(output_dim)
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x: (batch, channels, height, width) - MobileViT出力
+        Returns:
+            (batch, width, 768) - GPT-2入力形式
+        """
+        # (B, C, H, W) → (B, C, 1, W)
+        x = self.spatial_pool(x)
+
+        # (B, C, 1, W) → (B, W, C)
+        x = x.squeeze(2).permute(0, 2, 1)
+
+        # (B, W, C) → (B, W, 768)
+        x = self.projection(x)
+
+        return x
+
+
+class ConnectorForBiLSTM(nn.Module):
+    """BiLSTM出力用のコネクタ (GPT-2 small用)
+
+    BiLSTMの出力 (seq_len, hidden_size) をGPT-2の入力形式に変換
+    """
+    def __init__(self, input_dim=512, output_dim=768):
+        """
+        Args:
+            input_dim: BiLSTM出力の次元 (512: bidirectional 256*2)
+            output_dim: GPT-2のhidden_size (768)
+        """
+        super().__init__()
+
+        # Projection: 512 → 768
         self.projection = nn.Sequential(
             nn.Linear(input_dim, output_dim),
             nn.GELU(),
@@ -216,20 +267,23 @@ class Connector(nn.Module):
         )
 
     def forward(self, x):
+        """
+        Args:
+            x: (batch, seq_len, 512) - BiLSTM出力
+        Returns:
+            (batch, seq_len, 768) - GPT-2入力形式
+        """
+        return self.projection(x)
 
-        x = self.projection(x)   # (batch, 128, 3072) - 次元拡張
-        return x
 
-
-class LLMWithLLaMA(nn.Module):
+class LLMWithGPT2(nn.Module):
     """
-    LLaMAモデルのシンプルなラッパークラス
+    GPT-2 smallモデルのシンプルなラッパークラス
     テキスト生成、ファインチューニング、推論を簡単に実行できる
     """
     def __init__(
         self,
-        model_name: str = "meta-llama/Llama-3.2-3B",  # 軽量モデル（3B）
-        # model_name: str = "meta-llama/Meta-Llama-3-8B",  # ベースモデル（8B）
+        model_name: str = "gpt2",  # GPT-2 small (124M params, hidden_size=768)
     ):
         """
         Args:
@@ -239,21 +293,21 @@ class LLMWithLLaMA(nn.Module):
 
         print(f"📦 Loading model: {model_name}")
 
-        # LLaMAモデルのロード（CPUでロード、後でnet.to(device)で自動移動）
-        self.model = LlamaForCausalLM.from_pretrained(
+        # GPT-2モデルのロード（CPUでロード、後でnet.to(device)で自動移動）
+        self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch.float16,  # メモリ削減: 16GB→8GB
+            torch_dtype=torch.float16,  # メモリ削減
             low_cpu_mem_usage=True,
         )
-        
+
         # トークナイザーのロード
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        
+
         # パディングトークンの設定
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
-        
+
         # モデル情報の取得
         self.config = self.model.config
 
@@ -264,7 +318,7 @@ class LLMWithLLaMA(nn.Module):
 
         # LLMパラメータを凍結（学習対象外にする）
         self.model.requires_grad_(False)
-        print(f"🔒 LLM parameters frozen (8B params not trainable)")
+        print(f"🔒 LLM parameters frozen (124M params not trainable)")
 
     def forward(
         self,
@@ -317,20 +371,27 @@ class CTCtopB(nn.Module):
         # LLM使用時のみ Connector と LLM をロード
         self.use_llm = use_llm
         if use_llm:
-            print("🔥 Loading LLM components (Connector + LLaMA-3.2-3B)...")
-            self.connector = Connector(input_dim=512)
-            self.llm = LLMWithLLaMA()
+            print("🔥 Loading LLM components (Connectors + GPT-2 small)...")
+            # 3つのConnector: MobileViT1 (64ch), MobileViT2 (128ch), BiLSTM layer1 (512)
+            self.connector_mvit1 = ConnectorForMobileViT(input_channels=64, output_dim=768)
+            self.connector_mvit2 = ConnectorForMobileViT(input_channels=128, output_dim=768)
+            self.connector_bilstm = ConnectorForBiLSTM(input_dim=512, output_dim=768)
+            self.llm = LLMWithGPT2()
         else:
             print("⚡ LLM disabled: Using CNN shortcut only")
-            self.connector = None
+            self.connector_mvit1 = None
+            self.connector_mvit2 = None
+            self.connector_bilstm = None
             self.llm = None
         
         
-    def forward(self, x, y_llm=None, transcr_llm=None):
+    def forward(self, x, mobilevit_outputs=None, transcr_llm=None):
         """
         Args:
             x: 全サンプルの特徴量 (batch_size, 256, 1, width)
-            y_llm: LLM用サンプルの特徴量 (llm_batch_size, 256, 1, width)
+            mobilevit_outputs: MobileViTの中間出力リスト [mvit1_output, mvit2_output]
+                - mvit1_output: (batch, 64, H, W) またはLLM用の場合 (llm_batch, 64, H, W)
+                - mvit2_output: (batch, 128, H, W) またはLLM用の場合 (llm_batch, 128, H, W)
             transcr_llm: LLM用の正解文字列 (llm_batch_size,)
         """
         # RNN処理（全サンプル）
@@ -346,51 +407,58 @@ class CTCtopB(nn.Module):
         # Final CTC projection
         y_ctc = self.fnl(y_rnn)  # (width, batch, nclasses)
 
-        # LLM処理（use_llm=true かつ 選択されたサンプルのみ）
-        output_llm = None
-        if self.use_llm and y_llm is not None and transcr_llm is not None and self.training:
-            # y_llmからRNN layer1の出力を取得（as per model_structure.md）
-            y_llm_seq = y_llm.permute(2, 3, 0, 1)[0]  # (width, llm_batch, 256)
-            y1_llm = self.rec1(y_llm_seq)[0]  # (width, llm_batch, 512) - layer1 output only
+        # LLM処理（use_llm=true かつ 学習時のみ）
+        llm_outputs = {}
+        if self.use_llm and mobilevit_outputs is not None and transcr_llm is not None and self.training:
+            # 3つのパスで次トークン予測損失を計算
+            mvit1_output, mvit2_output = mobilevit_outputs
 
-            # Connectorで3072次元に変換 (Llama-3.2-3B用)
-            prefix_input = y1_llm.permute(1, 0, 2)  # (llm_batch, width, 512)
+            # 1. MobileViT1出力 → GPT-2
+            inputs_embeds_mvit1 = self.connector_mvit1(mvit1_output)  # (llm_batch, W, 768)
 
-            # 🔍 デバッグ: 形状確認
-            # print(f"\n{'='*60}")
-            # print(f"[DEBUG] Shape verification")
-            # print(f"{'='*60}")
-            # print(f"y1_llm.shape:       {y1_llm.shape} (width, llm_batch, 512)")
-            # print(f"prefix_input.shape: {prefix_input.shape} (llm_batch, width, 512)")
-            # print(f"Expected:           (llm_batch, 128, 512)")
+            # 2. MobileViT2出力 → GPT-2
+            inputs_embeds_mvit2 = self.connector_mvit2(mvit2_output)  # (llm_batch, W, 768)
 
-            inputs_embeds = self.connector(prefix_input)   # (llm_batch,128, 3072)
+            # 3. BiLSTM layer1出力 → GPT-2
+            y1_llm = y1[:, :inputs_embeds_mvit1.size(0), :]  # (width, llm_batch, 512) - LLMサンプルのみ抽出
+            inputs_embeds_bilstm = self.connector_bilstm(y1_llm.permute(1, 0, 2))  # (llm_batch, width, 768)
 
-            # print(f"inputs_embeds.shape: {inputs_embeds.shape}")
-            # print(f"Expected:            (llm_batch, 21, 3072)")
+            # 各パスの長さを確認（異なる場合は最小長に合わせる）
+            min_seq_len = min(inputs_embeds_mvit1.size(1), inputs_embeds_mvit2.size(1), inputs_embeds_bilstm.size(1))
 
-            # テキストをトークン化（max_length=21で統一）
+            # 長さを統一
+            inputs_embeds_mvit1 = inputs_embeds_mvit1[:, :min_seq_len, :]
+            inputs_embeds_mvit2 = inputs_embeds_mvit2[:, :min_seq_len, :]
+            inputs_embeds_bilstm = inputs_embeds_bilstm[:, :min_seq_len, :]
+
+            # テキストをトークン化（統一された長さに合わせる）
             llm_labels = self.llm.tokenizer(
                 list(transcr_llm),
                 return_tensors="pt",
                 padding="max_length",
                 truncation=True,
-                max_length=inputs_embeds.shape[1]  # Connector出力の長さに合わせる
+                max_length=min_seq_len
             )
-            labels = llm_labels["input_ids"].to(y_llm.device)  # (llm_batch, 128)
+            labels = llm_labels["input_ids"].to(x.device)  # (llm_batch, min_seq_len)
 
-            # print(f"labels.shape:        {labels.shape}")
-            # print(f"Expected:            (llm_batch, 128)")
-            # print(f"{'='*60}\n")
+            # 各パスでGPT-2を実行
+            llm_outputs['mobilevit1'] = self.llm(
+                inputs_embeds=inputs_embeds_mvit1.half(),
+                labels=labels
+            )
 
+            llm_outputs['mobilevit2'] = self.llm(
+                inputs_embeds=inputs_embeds_mvit2.half(),
+                labels=labels
+            )
 
-            output_llm = self.llm(
-                inputs_embeds=inputs_embeds.half(),  # (batch, 128, 3072) float16に変換
-                labels=labels                         # (batch, 128) ← 長さ一致！
+            llm_outputs['bilstm_layer1'] = self.llm(
+                inputs_embeds=inputs_embeds_bilstm.half(),
+                labels=labels
             )
 
         if self.training:
-            return y_ctc, self.cnn(x).permute(2, 3, 0, 1)[0], output_llm
+            return y_ctc, self.cnn(x).permute(2, 3, 0, 1)[0], llm_outputs
         else:
             return y_ctc, self.cnn(x).permute(2, 3, 0, 1)[0]
 
@@ -433,18 +501,20 @@ class HTRNet(nn.Module):
         # 全サンプルの特徴量抽出
         if self.stn is not None:
             x = self.stn(x)
-        y = self.features(x)
 
-        # LLM用サンプルの特徴量抽出
-        y_llm = None
-        if img_llm is not None:
+        # LLM用の場合はMobileViTの中間出力も取得
+        mobilevit_outputs_llm = None
+        if img_llm is not None and self.top.use_llm:
             if self.stn is not None:
                 img_llm = self.stn(img_llm)
-            y_llm = self.features(img_llm)
+            y_llm, mobilevit_outputs_llm = self.features(img_llm, return_mobilevit_outputs=True)
+
+        # 通常の特徴量抽出（MobileViT中間出力は不要）
+        y = self.features(x, return_mobilevit_outputs=False)
 
         # CTCtopBに渡す
-        if transcr_llm is not None:
-            y = self.top(y, y_llm=y_llm, transcr_llm=transcr_llm)
+        if transcr_llm is not None and mobilevit_outputs_llm is not None:
+            y = self.top(y, mobilevit_outputs=mobilevit_outputs_llm, transcr_llm=transcr_llm)
         else:
             y = self.top(y)
 

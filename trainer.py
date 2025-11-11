@@ -151,9 +151,30 @@ class HTRTrainer(nn.Module):
         self.net = net
 
     def prepare_losses(self):
-        self.ctc_loss = lambda y, t, ly, lt: nn.CTCLoss(reduction='mean', zero_infinity=True)(F.log_softmax(y, dim=2), t, ly, lt) 
-        
-        self.lail_loss = lambda llm_output: llm_output.loss if(llm_output is not None and hasattr(llm_output, 'loss')) else torch.tensor(0.0,device=self.config.device)
+        self.ctc_loss = lambda y, t, ly, lt: nn.CTCLoss(reduction='mean', zero_infinity=True)(F.log_softmax(y, dim=2), t, ly, lt)
+
+        # 複数のLLM損失を計算するヘルパー関数
+        def compute_llm_losses(llm_outputs, loss_weights):
+            """
+            Args:
+                llm_outputs: dict with keys ['mobilevit1', 'mobilevit2', 'bilstm_layer1']
+                loss_weights: dict with weights for each path
+            Returns:
+                dict of individual losses and total weighted loss
+            """
+            losses = {}
+            total_loss = torch.tensor(0.0, device=self.config.device)
+
+            for key in ['mobilevit1', 'mobilevit2', 'bilstm_layer1']:
+                if key in llm_outputs and llm_outputs[key] is not None and hasattr(llm_outputs[key], 'loss'):
+                    losses[key] = llm_outputs[key].loss
+                    total_loss += loss_weights.get(key, 1.0) * losses[key]
+                else:
+                    losses[key] = torch.tensor(0.0, device=self.config.device)
+
+            return losses, total_loss
+
+        self.compute_llm_losses = compute_llm_losses
 
     def prepare_optimizers(self):
         config = self.config
@@ -269,6 +290,7 @@ class HTRTrainer(nn.Module):
             # 個別の損失を記録用に保存
             aux_loss_val = None
             llm_loss_val = None
+            llm_losses_individual = {}
 
             if config.arch.head_type == "both":
                 # 補助損失（CNN shortcut）- head_type="both" なら常に計算
@@ -276,11 +298,20 @@ class HTRTrainer(nn.Module):
                 loss_val += 0.1 * aux_loss_val
 
                 # LLM損失（use_llm=true の場合のみ計算）
-                if use_llm:
-                    llm_loss_raw = self.lail_loss(llm_output)
-                    if llm_loss_raw.item() > 0:
+                if use_llm and isinstance(llm_output, dict) and len(llm_output) > 0:
+                    # 損失の重みを設定から取得（デフォルト値を設定）
+                    loss_weights = config.train.get('loss_weights', {
+                        'mobilevit1': 0.3,
+                        'mobilevit2': 0.5,
+                        'bilstm_layer1': 1.0
+                    })
+
+                    # 複数のLLM損失を計算
+                    llm_losses_individual, llm_loss_total = self.compute_llm_losses(llm_output, loss_weights)
+
+                    if llm_loss_total.item() > 0:
                         llm_weight = 1.0 / llm_ratio
-                        llm_loss_val = (llm_loss_raw * llm_weight)*10
+                        llm_loss_val = (llm_loss_total * llm_weight) * 10
                         loss_val += llm_loss_val
                         # LLM損失トラッカーに記録
                         self.llm_tracker.update(llm_loss_val.item())
