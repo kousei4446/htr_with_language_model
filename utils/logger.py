@@ -45,7 +45,12 @@ class HTRLogger:
             'total': [],
             'ctc': [],
             'aux': [],
-            'llm': []  # LLM lossが計算された場合のみ追加
+            'bilstm_layer1': [],  # BiLSTM layer1 CTC lossが計算された場合のみ追加
+            'llm': [],  # LLM lossが計算された場合のみ追加
+            'roberta': [],  # RoBERTa補助lossが計算された場合のみ追加
+            'pll_bilstm': [],  # BiLSTM layer1 PLL lossが計算された場合のみ追加
+            'pll_mobilevit': [],  # MobileViT PLL lossが計算された場合のみ追加
+            'lm': []  # Language Model lossが計算された場合のみ追加
         }
 
     def log_hparams(self, config):
@@ -129,6 +134,46 @@ class HTRLogger:
             self.writer.add_scalar('train_epoch/llm_computation_ratio', llm_ratio, epoch)
 
             print(f'[Epoch {epoch}] LLM loss computed in {llm_ratio:.1%} of batches')
+
+        # RoBERTa補助損失の平均（計算された場合のみ）
+        if len(self.epoch_losses['roberta']) > 0:
+            avg_roberta = sum(self.epoch_losses['roberta']) / len(self.epoch_losses['roberta'])
+            self.writer.add_scalar('train_epoch/avg_roberta_loss', avg_roberta, epoch)
+            # RoBERTa lossが計算された割合
+            roberta_ratio = len(self.epoch_losses['roberta']) / len(self.epoch_losses['total'])
+            self.writer.add_scalar('train_epoch/roberta_computation_ratio', roberta_ratio, epoch)
+
+            print(f'[Epoch {epoch}] RoBERTa loss computed in {roberta_ratio:.1%} of batches, avg={avg_roberta:.4f}')
+
+        # BiLSTM layer1 PLL損失の平均（計算された場合のみ）
+        if len(self.epoch_losses['pll_bilstm']) > 0:
+            avg_pll_bilstm = sum(self.epoch_losses['pll_bilstm']) / len(self.epoch_losses['pll_bilstm'])
+            self.writer.add_scalar('train_epoch/avg_pll_bilstm_loss', avg_pll_bilstm, epoch)
+            # BiLSTM PLL lossが計算された割合
+            pll_bilstm_ratio = len(self.epoch_losses['pll_bilstm']) / len(self.epoch_losses['total'])
+            self.writer.add_scalar('train_epoch/pll_bilstm_computation_ratio', pll_bilstm_ratio, epoch)
+
+            print(f'[Epoch {epoch}] BiLSTM PLL loss computed in {pll_bilstm_ratio:.1%} of batches, avg={avg_pll_bilstm:.4f}')
+
+        # MobileViT PLL損失の平均（計算された場合のみ）
+        if len(self.epoch_losses['pll_mobilevit']) > 0:
+            avg_pll_mobilevit = sum(self.epoch_losses['pll_mobilevit']) / len(self.epoch_losses['pll_mobilevit'])
+            self.writer.add_scalar('train_epoch/avg_pll_mobilevit_loss', avg_pll_mobilevit, epoch)
+            # MobileViT PLL lossが計算された割合
+            pll_mobilevit_ratio = len(self.epoch_losses['pll_mobilevit']) / len(self.epoch_losses['total'])
+            self.writer.add_scalar('train_epoch/pll_mobilevit_computation_ratio', pll_mobilevit_ratio, epoch)
+
+            print(f'[Epoch {epoch}] MobileViT PLL loss computed in {pll_mobilevit_ratio:.1%} of batches, avg={avg_pll_mobilevit:.4f}')
+
+        # Language Model損失の平均（計算された場合のみ）
+        if len(self.epoch_losses['lm']) > 0:
+            avg_lm = sum(self.epoch_losses['lm']) / len(self.epoch_losses['lm'])
+            self.writer.add_scalar('train_epoch/avg_lm_loss', avg_lm, epoch)
+            # LM lossが計算された割合
+            lm_ratio = len(self.epoch_losses['lm']) / len(self.epoch_losses['total'])
+            self.writer.add_scalar('train_epoch/lm_computation_ratio', lm_ratio, epoch)
+
+            print(f'[Epoch {epoch}] LM loss computed in {lm_ratio:.1%} of batches, avg={avg_lm:.4f}')
 
         # 次のepochのためにリセット
         self.reset_epoch_stats()

@@ -1,4 +1,4 @@
-resume:
+resume: "./saved_models/CRNN+transformer/800.pt"
 save: './temp.pt'
 
 device: 'cuda:0'
@@ -24,14 +24,26 @@ arch:
 
 # training
 train:
-  lr: 1e-3
-  num_epochs: 800
+  lr: 1e-5  # Reduced for fine-tuning with LM loss only
+  num_epochs: 100  # Shorter experiment duration
   batch_size: 32
   scheduler: 'mstep'  # right now only 'mstep' is supported, i.e. multistep
-  save_every_k_epochs: 50
+  save_every_k_epochs: 10  # More frequent evaluation
   num_workers: 3
+  use_ctc_in_stage2: true  # Disable CTC loss in Stage2 (for LM-only fine-tuning)
   use_llm: false  # Enable LLM-based learning (true/false)
   llm_sample_ratio: 0.125  # 1/8 of samples per batch use LLM (only when use_llm=true)
+  use_roberta_aux: false  # Enable RoBERTa auxiliary loss (true/false)
+  roberta_weight: 0.5  # Weight for RoBERTa auxiliary loss
+  roberta_sample_ratio: 1.0  # 1/8 of samples per batch use RoBERTa (only when use_roberta_aux=true)
+  use_pll_loss: false  # Enable RoBERTa PLL (Pseudo Log-Likelihood) loss (true/false)
+  bilstm_pll_weight: 0.03  # Weight for BiLSTM layer1 PLL loss
+  mobilevit_pll_weight: 0.015  # Weight for MobileViT PLL loss
+  pll_sample_ratio: 0.25
+  use_lm_loss: false  # Enable Language Model loss (GPT-2 based) (true/false)
+  lm_model_name: 'gpt2'  # Language model to use for LM loss (e.g., 'gpt2', 'gpt2-medium')
+  lm_weight: 0.1  # Weight for LM loss (increased for LM-only fine-tuning)
+  lm_sample_ratio: 1  # Fraction of samples per batch to use for LM loss (e.g., 0.25 = 25%)
 
 # evaluation
 eval:
@@ -42,4 +54,4 @@ eval:
 
 # model saving and logging
 model:
-  save_dir: './saved_models/11-04_llmmobilevit'
+  save_dir: './saved_models/decode'
