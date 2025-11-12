@@ -519,3 +519,31 @@ class HTRNet(nn.Module):
             y = self.top(y)
 
         return y
+
+    def freeze_except_connectors(self):
+        """Freeze all parameters except connector layers"""
+        # Freeze CNN backbone
+        for param in self.features.parameters():
+            param.requires_grad = False
+
+        # Freeze BiLSTM layers
+        if hasattr(self.top, 'rec1'):
+            for param in self.top.rec1.parameters():
+                param.requires_grad = False
+        if hasattr(self.top, 'recN'):
+            for param in self.top.recN.parameters():
+                param.requires_grad = False
+
+        # Freeze CTC heads
+        if hasattr(self.top, 'fnl'):
+            for param in self.top.fnl.parameters():
+                param.requires_grad = False
+        if hasattr(self.top, 'cnn'):
+            for param in self.top.cnn.parameters():
+                param.requires_grad = False
+
+        # Log trainable parameters
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in self.parameters())
+        print(f"Frozen all parameters except connectors")
+        print(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.2f}%)")

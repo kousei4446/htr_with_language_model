@@ -139,6 +139,9 @@ class HTRTrainer(nn.Module):
             
         net.to(device)
 
+        # Freeze all parameters except connectors
+        net.freeze_except_connectors()
+
         # LLM使用時はデバイス確認
         if use_llm and hasattr(net.top, 'llm') and net.top.llm is not None:
             llm_device = next(net.top.llm.model.parameters()).device
