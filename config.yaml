@@ -1,4 +1,4 @@
-resume:
+resume: './saved_models/CRNN+transformer/800.pt'
 save: './temp.pt'
 
 device: 'cuda:0'
@@ -28,7 +28,7 @@ train:
   num_epochs: 800
   batch_size: 32
   scheduler: 'mstep'  # right now only 'mstep' is supported, i.e. multistep
-  save_every_k_epochs: 50
+  save_every_k_epochs: 25
   num_workers: 3
   use_llm: true  # Enable LLM-based learning (true/false)
   llm_sample_ratio: 0.125  # 1/8 of samples per batch use LLM (only when use_llm=true)
@@ -46,4 +46,4 @@ eval:
 
 # model saving and logging
 model:
-  save_dir: './saved_models/11-04_llmmobilevit'
+  save_dir: './saved_models/コネクタ層ートークン一致'

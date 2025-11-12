@@ -227,12 +227,15 @@ class ConnectorForMobileViT(nn.Module):
             nn.LayerNorm(output_dim)
         )
 
-    def forward(self, x):
+    def forward(self, x, target_lengths=None, attention_mask=None):
         """
         Args:
             x: (batch, channels, height, width) - MobileViT出力
+            target_lengths: (batch,) - 各サンプルのターゲットトークン数（Noneの場合は動的調整なし）
+            attention_mask: (batch, max_len) - 出力用attention mask（出力時に更新される）
         Returns:
-            (batch, width, 768) - GPT-2入力形式
+            (batch, target_max_len, 768) - GPT-2入力形式（target_lengths指定時）
+            または (batch, width, 768) - GPT-2入力形式（target_lengths未指定時）
         """
         # (B, C, H, W) → (B, C, 1, W)
         x = self.spatial_pool(x)
@@ -240,7 +243,35 @@ class ConnectorForMobileViT(nn.Module):
         # (B, C, 1, W) → (B, W, C)
         x = x.squeeze(2).permute(0, 2, 1)
 
-        # (B, W, C) → (B, W, 768)
+        # Dynamic width pooling to match target token lengths
+        if target_lengths is not None:
+            batch_size = x.size(0)
+            max_target_len = target_lengths.max().item()
+
+            # Adaptive pooling per sample to target length
+            pooled_outputs = []
+            for i in range(batch_size):
+                # (1, C, W) → adaptive pool → (1, C, target_len)
+                sample = x[i:i+1].permute(0, 2, 1)  # (1, C, W)
+                target_len = target_lengths[i].item()
+                pooled = torch.nn.functional.adaptive_avg_pool1d(sample, target_len)
+                pooled = pooled.permute(0, 2, 1)  # (1, target_len, C)
+                pooled_outputs.append(pooled)
+
+            # Pad to max length in batch
+            padded_outputs = []
+            for i, pooled in enumerate(pooled_outputs):
+                current_len = target_lengths[i].item()
+                pad_len = max_target_len - current_len
+                if pad_len > 0:
+                    padding = torch.zeros(1, pad_len, x.size(2),
+                                        device=x.device, dtype=x.dtype)
+                    pooled = torch.cat([pooled, padding], dim=1)
+                padded_outputs.append(pooled)
+
+            x = torch.cat(padded_outputs, dim=0)  # (B, max_target_len, C)
+
+        # (B, seq_len, C) → (B, seq_len, 768)
         x = self.projection(x)
 
         return x
@@ -266,13 +297,44 @@ class ConnectorForBiLSTM(nn.Module):
             nn.LayerNorm(output_dim)
         )
 
-    def forward(self, x):
+    def forward(self, x, target_lengths=None, attention_mask=None):
         """
         Args:
             x: (batch, seq_len, 512) - BiLSTM出力
+            target_lengths: (batch,) - 各サンプルのターゲットトークン数（Noneの場合は動的調整なし）
+            attention_mask: (batch, max_len) - 出力用attention mask（出力時に更新される）
         Returns:
-            (batch, seq_len, 768) - GPT-2入力形式
+            (batch, target_max_len, 768) - GPT-2入力形式（target_lengths指定時）
+            または (batch, seq_len, 768) - GPT-2入力形式（target_lengths未指定時）
         """
+        # Dynamic sequence pooling to match target token lengths
+        if target_lengths is not None:
+            batch_size = x.size(0)
+            max_target_len = target_lengths.max().item()
+
+            # Adaptive pooling per sample to target length
+            pooled_outputs = []
+            for i in range(batch_size):
+                # (1, 512, seq_len) → adaptive pool → (1, 512, target_len)
+                sample = x[i:i+1].permute(0, 2, 1)  # (1, 512, seq_len)
+                target_len = target_lengths[i].item()
+                pooled = torch.nn.functional.adaptive_avg_pool1d(sample, target_len)
+                pooled = pooled.permute(0, 2, 1)  # (1, target_len, 512)
+                pooled_outputs.append(pooled)
+
+            # Pad to max length in batch
+            padded_outputs = []
+            for i, pooled in enumerate(pooled_outputs):
+                current_len = target_lengths[i].item()
+                pad_len = max_target_len - current_len
+                if pad_len > 0:
+                    padding = torch.zeros(1, pad_len, x.size(2),
+                                        device=x.device, dtype=x.dtype)
+                    pooled = torch.cat([pooled, padding], dim=1)
+                padded_outputs.append(pooled)
+
+            x = torch.cat(padded_outputs, dim=0)  # (B, max_target_len, 512)
+
         return self.projection(x)
 
 
@@ -324,21 +386,24 @@ class LLMWithGPT2(nn.Module):
         self,
         inputs_embeds: torch.Tensor,
         labels: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
     ):
         """
         Simplified forward pass (参考コードベース)
 
         Args:
             inputs_embeds: (batch, seq_len, hidden_size) - RNN出力→Connector変換済み
-            labels: (batch, text_len) - テキストのトークンID
+            labels: (batch, text_len) - テキストのトークンID（-100はパディング）
+            attention_mask: (batch, seq_len) - 1=実トークン, 0=パディング
 
         Returns:
             LLM outputs (loss含む)
         """
-        # そのまま渡す（参考コードと同じ）
+        # attention_maskを使ってパディング部分を無視
         outputs = self.model(
             inputs_embeds=inputs_embeds,
             labels=labels,
+            attention_mask=attention_mask,
             return_dict=True,
         )
 
@@ -413,48 +478,60 @@ class CTCtopB(nn.Module):
             # 3つのパスで次トークン予測損失を計算
             mvit1_output, mvit2_output = mobilevit_outputs
 
-            # 1. MobileViT1出力 → GPT-2
-            inputs_embeds_mvit1 = self.connector_mvit1(mvit1_output)  # (llm_batch, W, 768)
-
-            # 2. MobileViT2出力 → GPT-2
-            inputs_embeds_mvit2 = self.connector_mvit2(mvit2_output)  # (llm_batch, W, 768)
-
-            # 3. BiLSTM layer1出力 → GPT-2
-            y1_llm = y1[:, :inputs_embeds_mvit1.size(0), :]  # (width, llm_batch, 512) - LLMサンプルのみ抽出
-            inputs_embeds_bilstm = self.connector_bilstm(y1_llm.permute(1, 0, 2))  # (llm_batch, width, 768)
-
-            # 各パスの長さを確認（異なる場合は最小長に合わせる）
-            min_seq_len = min(inputs_embeds_mvit1.size(1), inputs_embeds_mvit2.size(1), inputs_embeds_bilstm.size(1))
-
-            # 長さを統一
-            inputs_embeds_mvit1 = inputs_embeds_mvit1[:, :min_seq_len, :]
-            inputs_embeds_mvit2 = inputs_embeds_mvit2[:, :min_seq_len, :]
-            inputs_embeds_bilstm = inputs_embeds_bilstm[:, :min_seq_len, :]
-
-            # テキストをトークン化（統一された長さに合わせる）
-            llm_labels = self.llm.tokenizer(
+            # 正解文字列をトークン化して、各サンプルの実際のトークン数を取得
+            tokenized = self.llm.tokenizer(
                 list(transcr_llm),
                 return_tensors="pt",
-                padding="max_length",
+                padding=True,  # バッチ内の最大長に合わせてパディング
                 truncation=True,
-                max_length=min_seq_len
+                max_length=512
             )
-            labels = llm_labels["input_ids"].to(x.device)  # (llm_batch, min_seq_len)
+            labels = tokenized["input_ids"].to(x.device)
+            attention_mask = tokenized["attention_mask"].to(x.device)
 
-            # 各パスでGPT-2を実行
+            # 各サンプルの実際のトークン数を取得
+            target_lengths = attention_mask.sum(dim=1)  # (llm_batch,)
+            max_target_len = target_lengths.max().item()
+
+            # 1. MobileViT1出力 → GPT-2（target_lengthsに合わせて動的調整）
+            inputs_embeds_mvit1 = self.connector_mvit1(
+                mvit1_output,
+                target_lengths=target_lengths
+            )  # (llm_batch, max_target_len, 768)
+
+            # 2. MobileViT2出力 → GPT-2（target_lengthsに合わせて動的調整）
+            inputs_embeds_mvit2 = self.connector_mvit2(
+                mvit2_output,
+                target_lengths=target_lengths
+            )  # (llm_batch, max_target_len, 768)
+
+            # 3. BiLSTM layer1出力 → GPT-2（target_lengthsに合わせて動的調整）
+            y1_llm = y1[:, :inputs_embeds_mvit1.size(0), :]  # (width, llm_batch, 512) - LLMサンプルのみ抽出
+            inputs_embeds_bilstm = self.connector_bilstm(
+                y1_llm.permute(1, 0, 2),
+                target_lengths=target_lengths
+            )  # (llm_batch, max_target_len, 768)
+
+            # パディング部分をマスク（labelsの-100でLLMは無視する）
+            labels = labels.masked_fill(attention_mask == 0, -100)
+
+            # 各パスでGPT-2を実行（attention_maskを使用）
             llm_outputs['mobilevit1'] = self.llm(
                 inputs_embeds=inputs_embeds_mvit1.half(),
-                labels=labels
+                labels=labels,
+                attention_mask=attention_mask
             )
 
             llm_outputs['mobilevit2'] = self.llm(
                 inputs_embeds=inputs_embeds_mvit2.half(),
-                labels=labels
+                labels=labels,
+                attention_mask=attention_mask
             )
 
             llm_outputs['bilstm_layer1'] = self.llm(
                 inputs_embeds=inputs_embeds_bilstm.half(),
-                labels=labels
+                labels=labels,
+                attention_mask=attention_mask
             )
 
         if self.training:
