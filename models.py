@@ -634,3 +634,29 @@ class HTRNet(nn.Module):
         total_params = sum(p.numel() for p in self.parameters())
         print(f"Frozen all parameters except connectors")
         print(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.2f}%)")
+    
+    def freeze_connector(self):
+        """Freeze ONLY connector layers"""
+        if not hasattr(self.top, 'use_llm') or not self.top.use_llm:
+            print("LLM is not used; no connectors to freeze.")
+            return
+
+        # Freeze connector layers with existence check
+        if hasattr(self.top, 'connector_mvit1') and self.top.connector_mvit1 is not None:
+            for param in self.top.connector_mvit1.parameters():
+                param.requires_grad = False
+
+        if hasattr(self.top, 'connector_mvit2') and self.top.connector_mvit2 is not None:
+            for param in self.top.connector_mvit2.parameters():
+                param.requires_grad = False
+
+        if hasattr(self.top, 'connector_bilstm') and self.top.connector_bilstm is not None:
+            for param in self.top.connector_bilstm.parameters():
+                param.requires_grad = False
+
+        # Log trainable parameters
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in self.parameters())
+        print(f"Frozen connector parameters")
+        print(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.2f}%)")
+        
