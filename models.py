@@ -204,15 +204,18 @@ class CTCtopR(nn.Module):
 
 
 class ConnectorForMobileViT(nn.Module):
-    """MobileViT出力用のコネクタ (GPT-2 small用)
+    """MobileViT出力用のコネクタ (GPT-2 small用、Q-Formerベース)
 
     MobileViTの2D特徴マップ (H, W, C) をGPT-2の入力形式 (seq_len, hidden_size=768) に変換
+    テキスト埋め込みをクエリとして使い、画像特徴から関連情報を抽出
     """
-    def __init__(self, input_channels, output_dim=768):
+    def __init__(self, input_channels, output_dim=768, num_heads=8, ffn_ratio=2):
         """
         Args:
             input_channels: MobileViT出力のチャネル数 (64 or 128)
             output_dim: GPT-2のhidden_size (768)
+            num_heads: Q-Formerのアテンションヘッド数 (8)
+            ffn_ratio: Q-FormerのFFN次元倍率 (2)
         """
         super().__init__()
 
@@ -220,19 +223,21 @@ class ConnectorForMobileViT(nn.Module):
         # Height方向をmax poolingで圧縮
         self.spatial_pool = nn.AdaptiveMaxPool2d((1, None))
 
-        # Projection: C → 768
-        self.projection = nn.Sequential(
-            nn.Linear(input_channels, output_dim),
-            nn.GELU(),
-            nn.LayerNorm(output_dim)
+        # Q-Former: テキスト埋め込みクエリで画像特徴から情報抽出
+        self.qformer = LightweightQFormerConnector(
+            input_dim=input_channels,
+            output_dim=output_dim,
+            num_heads=num_heads,
+            ffn_ratio=ffn_ratio
         )
 
-    def forward(self, x):
+    def forward(self, x, text_embeddings):
         """
         Args:
             x: (batch, channels, height, width) - MobileViT出力
+            text_embeddings: (batch, text_len, 768) - GPT-2埋め込みから得たテキスト表現
         Returns:
-            (batch, width, 768) - GPT-2入力形式
+            (batch, text_len, 768) - 画像情報で強化されたテキスト表現
         """
         # (B, C, H, W) → (B, C, 1, W)
         x = self.spatial_pool(x)
@@ -240,40 +245,120 @@ class ConnectorForMobileViT(nn.Module):
         # (B, C, 1, W) → (B, W, C)
         x = x.squeeze(2).permute(0, 2, 1)
 
-        # (B, W, C) → (B, W, 768)
-        x = self.projection(x)
+        # Q-Formerで画像特徴から情報抽出
+        # (B, W, C) + (B, text_len, 768) → (B, text_len, 768)
+        x = self.qformer(x, text_embeddings)
 
         return x
 
 
 class ConnectorForBiLSTM(nn.Module):
-    """BiLSTM出力用のコネクタ (GPT-2 small用)
+    """BiLSTM出力用のコネクタ (GPT-2 small用、Q-Formerベース)
 
     BiLSTMの出力 (seq_len, hidden_size) をGPT-2の入力形式に変換
+    テキスト埋め込みをクエリとして使い、BiLSTM特徴から関連情報を抽出
     """
-    def __init__(self, input_dim=512, output_dim=768):
+    def __init__(self, input_dim=512, output_dim=768, num_heads=8, ffn_ratio=2):
         """
         Args:
             input_dim: BiLSTM出力の次元 (512: bidirectional 256*2)
             output_dim: GPT-2のhidden_size (768)
+            num_heads: Q-Formerのアテンションヘッド数 (8)
+            ffn_ratio: Q-FormerのFFN次元倍率 (2)
         """
         super().__init__()
 
-        # Projection: 512 → 768
-        self.projection = nn.Sequential(
-            nn.Linear(input_dim, output_dim),
-            nn.GELU(),
-            nn.LayerNorm(output_dim)
+        # Q-Former: テキスト埋め込みクエリでBiLSTM特徴から情報抽出
+        self.qformer = LightweightQFormerConnector(
+            input_dim=input_dim,
+            output_dim=output_dim,
+            num_heads=num_heads,
+            ffn_ratio=ffn_ratio
         )
 
-    def forward(self, x):
+    def forward(self, x, text_embeddings):
         """
         Args:
             x: (batch, seq_len, 512) - BiLSTM出力
+            text_embeddings: (batch, text_len, 768) - GPT-2埋め込みから得たテキスト表現
         Returns:
-            (batch, seq_len, 768) - GPT-2入力形式
+            (batch, text_len, 768) - BiLSTM情報で強化されたテキスト表現
         """
-        return self.projection(x)
+        return self.qformer(x, text_embeddings)
+
+
+class LightweightQFormerConnector(nn.Module):
+    """超軽量Q-Formerコネクタ（テキスト埋め込みクエリ方式）
+
+    GPT-2の埋め込み層から得たテキスト表現をクエリとして使用し、
+    Cross-Attentionで画像特徴から関連情報を選択的に抽出する。
+
+    構成:
+    - Self-Attention削除（テキスト間の関係はGPT-2が学習）
+    - 1層のCross-Attention + FFN
+    - FFN次元: 768*2（軽量化）
+    - パラメータ数: 約4.8M/コネクタ
+    """
+    def __init__(self, input_dim, output_dim=768, num_heads=8, ffn_ratio=2):
+        """
+        Args:
+            input_dim: 入力特徴の次元（MobileViT: 64/128, BiLSTM: 512）
+            output_dim: GPT-2のhidden_size (768)
+            num_heads: アテンションヘッド数 (8)
+            ffn_ratio: FFN次元倍率 (2 → 768*2=1536)
+        """
+        super().__init__()
+
+        # 画像特徴投影: input_dim → 768
+        self.input_projection = nn.Linear(input_dim, output_dim)
+
+        # テキスト埋め込み投影 (クエリ生成用)
+        self.text_projection = nn.Sequential(
+            nn.Linear(output_dim, output_dim),
+            nn.LayerNorm(output_dim)
+        )
+
+        # Cross-Attention (1層のみ)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=output_dim,
+            num_heads=num_heads,
+            batch_first=True
+        )
+        self.attn_norm = nn.LayerNorm(output_dim)
+
+        # FFN (768 → 1536 → 768)
+        ffn_dim = output_dim * ffn_ratio
+        self.ffn = nn.Sequential(
+            nn.Linear(output_dim, ffn_dim),
+            nn.GELU(),
+            nn.Linear(ffn_dim, output_dim)
+        )
+        self.ffn_norm = nn.LayerNorm(output_dim)
+
+    def forward(self, x, text_embeddings):
+        """
+        Args:
+            x: (batch, seq_len, input_dim) - 画像特徴（コネクタ出力）
+            text_embeddings: (batch, text_len, 768) - GPT-2埋め込みから得たテキスト表現
+        Returns:
+            (batch, text_len, 768) - 画像情報で強化されたテキスト表現
+        """
+        # 画像特徴を投影
+        x = self.input_projection(x)  # (batch, seq_len, 768)
+
+        # テキスト埋め込みをクエリに変換（dtype変換）
+        text_embeddings = text_embeddings.to(dtype=self.text_projection[0].weight.dtype, device=text_embeddings.device)
+        queries = self.text_projection(text_embeddings)  # (batch, text_len, 768)
+
+        # Cross-Attention: テキストクエリで画像特徴から情報抽出
+        attn_out, _ = self.cross_attn(queries, x, x)  # (batch, text_len, 768)
+        queries = self.attn_norm(queries + attn_out)  # Residual connection
+
+        # FFN
+        ffn_out = self.ffn(queries)
+        queries = self.ffn_norm(queries + ffn_out)  # Residual connection
+
+        return queries
 
 
 class LLMWithGPT2(nn.Module):
@@ -291,7 +376,7 @@ class LLMWithGPT2(nn.Module):
         """
         super().__init__()
 
-        print(f"📦 Loading model: {model_name}")
+        print(f"[*] Loading model: {model_name}")
 
         # GPT-2モデルのロード（CPUでロード、後でnet.to(device)で自動移動）
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -311,14 +396,14 @@ class LLMWithGPT2(nn.Module):
         # モデル情報の取得
         self.config = self.model.config
 
-        print(f"✅ Model loaded successfully!")
-        print(f"   Hidden size: {self.config.hidden_size}")
-        print(f"   Vocab size: {self.config.vocab_size}")
-        print(f"   Initial device: CPU (will move to GPU with net.to(device))")
+        print(f"[+] Model loaded successfully!")
+        print(f"    Hidden size: {self.config.hidden_size}")
+        print(f"    Vocab size: {self.config.vocab_size}")
+        print(f"    Initial device: CPU (will move to GPU with net.to(device))")
 
         # LLMパラメータを凍結（学習対象外にする）
         self.model.requires_grad_(False)
-        print(f"🔒 LLM parameters frozen (124M params not trainable)")
+        print(f"[!] LLM parameters frozen (124M params not trainable)")
 
     def forward(
         self,
@@ -371,14 +456,14 @@ class CTCtopB(nn.Module):
         # LLM使用時のみ Connector と LLM をロード
         self.use_llm = use_llm
         if use_llm:
-            print("🔥 Loading LLM components (Connectors + GPT-2 small)...")
+            print("[*] Loading LLM components (Connectors + GPT-2 small)...")
             # 3つのConnector: MobileViT1 (64ch), MobileViT2 (128ch), BiLSTM layer1 (512)
             self.connector_mvit1 = ConnectorForMobileViT(input_channels=64, output_dim=768)
             self.connector_mvit2 = ConnectorForMobileViT(input_channels=128, output_dim=768)
             self.connector_bilstm = ConnectorForBiLSTM(input_dim=512, output_dim=768)
             self.llm = LLMWithGPT2()
         else:
-            print("⚡ LLM disabled: Using CNN shortcut only")
+            print("[!] LLM disabled: Using CNN shortcut only")
             self.connector_mvit1 = None
             self.connector_mvit2 = None
             self.connector_bilstm = None
@@ -413,33 +498,35 @@ class CTCtopB(nn.Module):
             # 3つのパスで次トークン予測損失を計算
             mvit1_output, mvit2_output = mobilevit_outputs
 
-            # 1. MobileViT1出力 → GPT-2
-            inputs_embeds_mvit1 = self.connector_mvit1(mvit1_output)  # (llm_batch, W, 768)
-
-            # 2. MobileViT2出力 → GPT-2
-            inputs_embeds_mvit2 = self.connector_mvit2(mvit2_output)  # (llm_batch, W, 768)
-
-            # 3. BiLSTM layer1出力 → GPT-2
-            y1_llm = y1[:, :inputs_embeds_mvit1.size(0), :]  # (width, llm_batch, 512) - LLMサンプルのみ抽出
-            inputs_embeds_bilstm = self.connector_bilstm(y1_llm.permute(1, 0, 2))  # (llm_batch, width, 768)
-
-            # 各パスの長さを確認（異なる場合は最小長に合わせる）
-            min_seq_len = min(inputs_embeds_mvit1.size(1), inputs_embeds_mvit2.size(1), inputs_embeds_bilstm.size(1))
-
-            # 長さを統一
-            inputs_embeds_mvit1 = inputs_embeds_mvit1[:, :min_seq_len, :]
-            inputs_embeds_mvit2 = inputs_embeds_mvit2[:, :min_seq_len, :]
-            inputs_embeds_bilstm = inputs_embeds_bilstm[:, :min_seq_len, :]
-
-            # テキストをトークン化（統一された長さに合わせる）
+            # 正解文字列をトークン化
             llm_labels = self.llm.tokenizer(
                 list(transcr_llm),
                 return_tensors="pt",
-                padding="max_length",
+                padding=True,  # バッチ内で長さを揃える
                 truncation=True,
-                max_length=min_seq_len
+                max_length=512  # GPT-2の最大コンテキスト長を考慮
             )
-            labels = llm_labels["input_ids"].to(x.device)  # (llm_batch, min_seq_len)
+            labels = llm_labels["input_ids"].to(x.device)  # (llm_batch, text_len)
+
+            # GPT-2の埋め込み層でテキスト埋め込みを取得
+            with torch.no_grad():  # クエリとして使うだけなので勾配不要
+                text_embeddings = self.llm.model.transformer.wte(labels)  # (llm_batch, text_len, 768)
+
+            # 各コネクタにテキスト埋め込みを渡す
+            # Q-Formerが画像特徴からテキストに関連する情報を抽出
+
+            # 1. MobileViT1出力 → Q-Former → GPT-2入力形式
+            inputs_embeds_mvit1 = self.connector_mvit1(mvit1_output, text_embeddings)  # (llm_batch, text_len, 768)
+
+            # 2. MobileViT2出力 → Q-Former → GPT-2入力形式
+            inputs_embeds_mvit2 = self.connector_mvit2(mvit2_output, text_embeddings)  # (llm_batch, text_len, 768)
+
+            # 3. BiLSTM layer1出力 → Q-Former → GPT-2入力形式
+            y1_llm = y1[:, :text_embeddings.size(0), :]  # (width, llm_batch, 512) - LLMサンプルのみ抽出
+            inputs_embeds_bilstm = self.connector_bilstm(y1_llm.permute(1, 0, 2), text_embeddings)  # (llm_batch, text_len, 768)
+
+            # すべて (llm_batch, text_len, 768) で統一されている
+            # 最小長への切り詰め処理は不要（Q-Formerが自動的に調整）
 
             # 各パスでGPT-2を実行
             llm_outputs['mobilevit1'] = self.llm(

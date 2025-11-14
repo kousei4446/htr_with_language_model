@@ -19,45 +19,6 @@ import torch.nn.functional as F
 from utils.metrics import CER, WER
 import re, torch
 
-def migrate_rec_to_both(state: dict) -> dict:
-    """Stage1の top.rec.* を Stage2の top.rec1.* / top.recN.* に写し替え。"""
-    out = dict(state)
-    pat = re.compile(r"^top\.rec\.(weight_ih|weight_hh|bias_ih|bias_hh)_l(\d+)(?:(_reverse))?$")
-    for k, v in list(state.items()):
-        m = pat.match(k)
-        if not m:
-            continue
-        kind, lvl, rev = m.group(1), int(m.group(2)), (m.group(3) or "")
-        newk = f"top.rec1.{kind}_l0{rev}" if lvl == 0 else f"top.recN.{kind}_l{lvl-1}{rev}"
-        out.setdefault(newk, v)  # 既にあれば触らない
-    return out
-
-def init_from_stage1(net: torch.nn.Module, ckpt_path: str, *, verbose: bool = True):
-    """Stage1 ckptで Stage2モデルを初期化（必要なら rec→rec1/recN に自動マップ）。"""
-    print(f"[init] load: {ckpt_path}")
-    obj = torch.load(ckpt_path, map_location="cpu")
-    state = obj.get("state_dict", obj.get("model", obj))
-
-    # DataParallel 'module.' 剥がし
-    if any(k.startswith("module.") for k in state):
-        state = {k.replace("module.", "", 1): v for k, v in state.items()}
-
-    # モデル側が rec1/recN なのに ckpt が rec.* ならキーをマップ
-    msd = net.state_dict()
-    need_both = any(k.startswith(("top.rec1.", "top.recN.")) for k in msd.keys())
-    has_rec   = any(k.startswith("top.rec.") for k in state.keys())
-    if need_both and has_rec:
-        state = migrate_rec_to_both(state)
-
-    # 形状一致だけ安全に流し込む
-    safe = {k: v for k, v in state.items() if (k in msd) and (msd[k].shape == v.shape)}
-    incompat = net.load_state_dict(safe, strict=False)
-
-    if verbose:
-        print(f"[init] loaded {len(safe)}/{len(msd)} params")
-        if hasattr(incompat, "missing_keys"):
-            print(f"[init] missing={len(incompat.missing_keys)} unexpected={len(incompat.unexpected_keys)}")
-    return incompat
 
 class HTRTrainer(nn.Module):
     def __init__(self, config):
@@ -134,9 +95,13 @@ class HTRTrainer(nn.Module):
 
         net = HTRNet(config.arch, len(classes) + 1, use_llm=use_llm)
         
+
         if config.resume is not None:
-            _ = init_from_stage1(net, config.resume) 
-            
+            print(f"[Loading checkpoint: {config.resume}]")
+            load_dict = torch.load(config.resume, map_location="cpu")
+            missing, unexpected = net.load_state_dict(load_dict, strict=False)
+            print(f"[Loaded params. Missing: {len(missing)}, Unexpected: {len(unexpected)}]")
+
         net.to(device)
 
         # Freeze all parameters except connectors
@@ -287,8 +252,8 @@ class HTRTrainer(nn.Module):
             act_lens = torch.LongTensor(img.size(0)*[output.size(0)]).to(device)
 
             # CTC損失計算
-            ctc_loss_val = self.ctc_loss(output, labels, act_lens, label_lens)
-            loss_val = ctc_loss_val
+            # ctc_loss_val = self.ctc_loss(output, labels, act_lens, label_lens)
+            # loss_val = ctc_loss_val
 
             # 個別の損失を記録用に保存
             aux_loss_val = None
@@ -297,8 +262,8 @@ class HTRTrainer(nn.Module):
 
             if config.arch.head_type == "both":
                 # 補助損失（CNN shortcut）- head_type="both" なら常に計算
-                aux_loss_val = self.ctc_loss(aux_output, labels, act_lens, label_lens)
-                loss_val += 0.1 * aux_loss_val
+                # aux_loss_val = self.ctc_loss(aux_output, labels, act_lens, label_lens)
+                # loss_val += 0.1 * aux_loss_val
 
                 # LLM損失（use_llm=true の場合のみ計算）
                 if use_llm and isinstance(llm_output, dict) and len(llm_output) > 0:
@@ -315,7 +280,7 @@ class HTRTrainer(nn.Module):
                     if llm_loss_total.item() > 0:
                         llm_weight = 1.0 / llm_ratio
                         llm_loss_val = (llm_loss_total * llm_weight) * 10
-                        loss_val += llm_loss_val
+                        loss_val = llm_loss_val
                         # LLM損失トラッカーに記録
                         self.llm_tracker.update(llm_loss_val.item())
                     else:
@@ -329,7 +294,8 @@ class HTRTrainer(nn.Module):
 
             # エポック平均計算用にバッファに保存（バッチごとのログは削除）
             self.logger.epoch_losses['total'].append(tloss_val)
-            self.logger.epoch_losses['ctc'].append(ctc_loss_val.item())
+            
+            # self.logger.epoch_losses['ctc'].append(ctc_loss_val.item())
             if aux_loss_val is not None:
                 self.logger.epoch_losses['aux'].append(aux_loss_val.item())
             if llm_loss_val is not None:
