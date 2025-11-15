@@ -105,7 +105,7 @@ class HTRTrainer(nn.Module):
         net.to(device)
 
         # Freeze all parameters except connectors
-        net.freeze_connector()
+        # net.freeze_connector()
         # net.freeze_except_connectors()
 
         # LLM使用時はデバイス確認
