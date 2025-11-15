@@ -1,4 +1,4 @@
-resume:
+resume: "./saved_models/Q-Former-new/750.pt"
 save: './temp.pt'
 
 device: 'cuda:0'
@@ -13,23 +13,34 @@ preproc:
   image_width: 1024
 
 # architecture
-arch: 
-  cnn_cfg: [[2, 64], 'M', [3, 128], 'M', [2, 256]]
-  head_type: 'both'  # select from 'both' (rnn + cnn shortcut), 'rnn', 'cnn'
+arch:
+  cnn_cfg: [[2, 64], 'M', "mobilevit1", [4, 128], 'M' ,"mobilevit2", [4, 256]]
+  head_type: 'both'       # select from 'both' (rnn + cnn shortcut), 'rnn', 'cnn'
   rnn_type: 'lstm'
   rnn_layers: 3
   rnn_hidden_size: 256
   flattening: 'maxpool'
   stn: False
+  # Q-Former connector settings (lightweight configuration)
+  qformer_layers: 1       # Number of Q-Former layers (1 for ultra-lightweight)
+  qformer_heads: 8        # Number of attention heads
+  qformer_ffn_ratio: 2    # FFN dimension ratio (768*2=1536)
+  qformer_max_length: 512 # Maximum sequence length for text
 
 # training
 train:
-  lr: 1e-3
+  lr: 1e-4
   num_epochs: 800
-  batch_size: 16
-  scheduler: 'mstep'  # right now only 'mstep' is supported, i.e. multistep
+  batch_size: 40
+  scheduler: 'mstep'      # right now only 'mstep' is supported, i.e. multistep
   save_every_k_epochs: 50
-  num_workers: 8
+  num_workers: 3
+  use_llm: true           # Enable LLM-based learning (true/false)
+  llm_sample_ratio: 1 # 1/16 of samples per batch use LLM (only when use_llm=true)
+  loss_weights:
+    mobilevit1: 0.3       # Weight for MobileViT block 1 output → GPT-2 loss
+    mobilevit2: 0.5       # Weight for MobileViT block 2 output → GPT-2 loss
+    bilstm_layer1: 1.0    # Weight for BiLSTM layer 1 output → GPT-2 loss
 
 # evaluation
 eval:
@@ -40,4 +51,4 @@ eval:
 
 # model saving and logging
 model:
-  save_dir: './saved_models/'
+  save_dir: './saved_models/GPT3層+Q-Former'

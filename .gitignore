@@ -4,3 +4,8 @@
 *.pyc
 *.pt
 /def_htrnet
+
+check/
+
+runs/
+結果/
