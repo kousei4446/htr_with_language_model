@@ -106,6 +106,7 @@ class HTRTrainer(nn.Module):
 
         # Freeze all parameters except connectors
         net.freeze_connector()
+        # net.freeze_except_connectors()
 
         # LLM使用時はデバイス確認
         if use_llm and hasattr(net.top, 'llm') and net.top.llm is not None:
@@ -122,7 +123,7 @@ class HTRTrainer(nn.Module):
         self.ctc_loss = lambda y, t, ly, lt: nn.CTCLoss(reduction='mean', zero_infinity=True)(F.log_softmax(y, dim=2), t, ly, lt)
 
         # 複数のLLM損失を計算するヘルパー関数
-        def compute_llm_losses(llm_outputs, loss_weights):
+        def compute_llm_losses(llm_outputs, loss_weights,ids):
             """
             Args:
                 llm_outputs: dict with keys ['mobilevit1', 'mobilevit2', 'bilstm_layer1']
@@ -131,14 +132,60 @@ class HTRTrainer(nn.Module):
                 dict of individual losses and total weighted loss
             """
             losses = {}
-            total_loss = torch.tensor(0.0, device=self.config.device)
+            device = self.config.device
+            total_loss = torch.tensor(0.0, device=device)
+            
+            label_ids = ids.to(device)  # (B, L)
+            attn = llm_outputs.get('attention_mask', None)
+            if attn is not None:
+                attn = attn.to(device)
+                
+            
+            # --- 基準損失（テキスト埋め込みのみ） ---
+            # pad位置を-100にして、attention_maskは使わない
+            if attn is not None:
+                labels_ref = label_ids.masked_fill(attn == 0, -100)
+            else:
+                tok = self.net.top.llm.tokenizer
+                pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+                labels_ref = label_ids.masked_fill(label_ids == pad_id, -100)
+            llm_hf = self.net.top.llm.model
+            with torch.no_grad():
+                # ★ attention_maskを渡さない
+                ref_out = llm_hf(
+                    input_ids=label_ids,
+                    labels=labels_ref,
+                    use_cache=False
+                )
+                reference_loss = ref_out.loss.detach()
 
-            for key in ['mobilevit1', 'mobilevit2', 'bilstm_layer1']:
-                if key in llm_outputs and llm_outputs[key] is not None and hasattr(llm_outputs[key], 'loss'):
-                    losses[key] = llm_outputs[key].loss
-                    total_loss += loss_weights.get(key, 1.0) * losses[key]
+            # 取得したidsのテキストの可視化
+            # tok = self.net.top.llm.tokenizer
+            # print("🌟"*10)
+            # print("[LLM DEBUG] GT texts from label_ids/input_ids")
+            # for i in range(min(4, ids.size(0))):
+            #     if attn is not None:
+            #         seq = ids[i][attn[i].bool()].tolist()  # 有効トークンのみ
+            #     else:
+            #         seq = ids[i].tolist()
+            #     txt = tok.decode(seq, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+                # print(f"  [{i}] {repr(txt)}")
+            # print("🌟"*10)
+            
+            
+            # print("🍪"*20)
+            
+            # # 各ヘッドの損失を先に格納してから合計
+            head_keys = ['bilstm_layer1', 'mobilevit1', 'mobilevit2']
+            for k in head_keys:
+                if k in llm_outputs and hasattr(llm_outputs[k], 'loss'):
+                    head_loss = llm_outputs[k].loss
+                    total_loss += loss_weights.get(k, 1.0) * head_loss
+                    # デバック用表示
+                    # print(f"[LLM LOSS DEBUG] Head: {k}, Head Loss: {head_loss.item():.6f}, Reference Loss: {reference_loss.item():.6f}")
                 else:
-                    losses[key] = torch.tensor(0.0, device=self.config.device)
+                    losses[k] = torch.tensor(0.0, device=device)
+            # print("🍪"*20)
 
             return losses, total_loss
 
@@ -230,15 +277,16 @@ class HTRTrainer(nn.Module):
                     batch_size = img.size(0)
                     llm_ratio = config.train.get('llm_sample_ratio', 0.125)
                     llm_batch_size = max(1, int(batch_size * llm_ratio))
-
-                    # ランダムインデックス選択
-                    indices = torch.randperm(batch_size, device='cpu')[:llm_batch_size]
+                    
+                    # インデックスをGPUデバイスで生成
+                    indices = torch.randperm(batch_size, device=img.device)[:llm_batch_size]
                     img_llm = img[indices]
-                    transcr_llm = [transcr[i] for i in indices]
+                    transcr_llm = [transcr[i] for i in indices.cpu().tolist()]
+
 
                     # モデル呼び出し（全サンプル + LLM用サンプル）
                     output, aux_output, llm_output = self.net(
-                        img, img_llm=img_llm, transcr_llm=transcr_llm
+                        img, img_llm=img_llm, transcr_llm=transcr_llm,llm_indices=indices  
                     )
                 else:
                     # LLM無効: CNN shortcut のみ使用
@@ -252,8 +300,8 @@ class HTRTrainer(nn.Module):
             act_lens = torch.LongTensor(img.size(0)*[output.size(0)]).to(device)
 
             # CTC損失計算
-            # ctc_loss_val = self.ctc_loss(output, labels, act_lens, label_lens)
-            # loss_val = ctc_loss_val
+            ctc_loss_val = self.ctc_loss(output, labels, act_lens, label_lens)
+            loss_val = ctc_loss_val
 
             # 個別の損失を記録用に保存
             aux_loss_val = None
@@ -262,8 +310,8 @@ class HTRTrainer(nn.Module):
 
             if config.arch.head_type == "both":
                 # 補助損失（CNN shortcut）- head_type="both" なら常に計算
-                # aux_loss_val = self.ctc_loss(aux_output, labels, act_lens, label_lens)
-                # loss_val += 0.1 * aux_loss_val
+                aux_loss_val = self.ctc_loss(aux_output, labels, act_lens, label_lens)
+                loss_val += 0.1 * aux_loss_val
 
                 # LLM損失（use_llm=true の場合のみ計算）
                 if use_llm and isinstance(llm_output, dict) and len(llm_output) > 0:
@@ -273,19 +321,49 @@ class HTRTrainer(nn.Module):
                         'mobilevit2': 0.5,
                         'bilstm_layer1': 1.0
                     })
-
+                    
+                    tok = self.net.top.llm.tokenizer
+                    ids  = llm_output.get('input_ids', llm_output['label_ids'])  # label_idsは= input_ids
+                    attn = llm_output.get('attention_mask', None)
+                    
+                    # print("🍵"*10)
+                    # print("[LLM DEBUG] GT texts from label_ids/input_ids")
+                    for i in range(min(4, ids.size(0))):
+                        if attn is not None:
+                            seq = ids[i][attn[i].bool()].tolist()  # 有効トークンのみ
+                        else:
+                            seq = ids[i].tolist()
+                        txt = tok.decode(seq, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+                        # print(f"  [{i}] {repr(txt)}")
+                    # print("🍵"*10)
+                                        
                     # 複数のLLM損失を計算
-                    llm_losses_individual, llm_loss_total = self.compute_llm_losses(llm_output, loss_weights)
+                    llm_losses_individual, llm_loss_total = self.compute_llm_losses(llm_output, loss_weights,ids)
+                    
+                    # print("🍪"*20)
+                    # print()
 
-                    if llm_loss_total.item() > 0:
-                        llm_weight = 1.0 / llm_ratio
-                        llm_loss_val = (llm_loss_total * llm_weight) * 10
-                        loss_val = llm_loss_val
-                        # LLM損失トラッカーに記録
-                        self.llm_tracker.update(llm_loss_val.item())
-                    else:
-                        # LLM損失が計算されなかった
-                        self.llm_tracker.update(None)
+                    # # if llm_loss_total.item() > 0:
+                    
+                    # print("☆"*200)
+                    # print(llm_loss_total)
+                    # # 勾配が流れるか確認
+                    # print(llm_loss_total.requires_grad)
+                    # print("☆"*200)
+                    # print()
+                    
+                    
+                    llm_weight = 1.0 / llm_ratio
+                    llm_loss_val = (llm_loss_total * llm_weight)*0.005
+                    # print(f"[LLM LOSS] llm_loss_total: {llm_loss_total.item():.6f}, weighted: {llm_loss_val.item():.6f} (weight: {llm_weight:.2f})")
+                    
+                    loss_val += llm_loss_val
+                    # LLM損失トラッカーに記録
+                    self.llm_tracker.update(llm_loss_val.item())
+                    # else:
+                    #     # LLM損失が計算されなかった
+                    #     self.llm_tracker.update(None)
+
 
             tloss_val = loss_val.item()
 
@@ -295,7 +373,7 @@ class HTRTrainer(nn.Module):
             # エポック平均計算用にバッファに保存（バッチごとのログは削除）
             self.logger.epoch_losses['total'].append(tloss_val)
             
-            # self.logger.epoch_losses['ctc'].append(ctc_loss_val.item())
+            self.logger.epoch_losses['ctc'].append(ctc_loss_val.item())
             if aux_loss_val is not None:
                 self.logger.epoch_losses['aux'].append(aux_loss_val.item())
             if llm_loss_val is not None:

@@ -381,7 +381,6 @@ class LLMWithGPT2(nn.Module):
         # GPT-2モデルのロード（CPUでロード、後でnet.to(device)で自動移動）
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch.float16,  # メモリ削減
             low_cpu_mem_usage=True,
         )
 
@@ -409,6 +408,8 @@ class LLMWithGPT2(nn.Module):
         self,
         inputs_embeds: torch.Tensor,
         labels: torch.Tensor,
+        attention_mask: torch.Tensor = None,
+        use_cache: bool = False,
     ):
         """
         Simplified forward pass (参考コードベース)
@@ -424,6 +425,8 @@ class LLMWithGPT2(nn.Module):
         outputs = self.model(
             inputs_embeds=inputs_embeds,
             labels=labels,
+            attention_mask=attention_mask.to(self.model.device) if attention_mask is not None else None,
+            use_cache=use_cache,
             return_dict=True,
         )
 
@@ -470,7 +473,7 @@ class CTCtopB(nn.Module):
             self.llm = None
         
         
-    def forward(self, x, mobilevit_outputs=None, transcr_llm=None):
+    def forward(self, x, mobilevit_outputs=None, transcr_llm=None,llm_indces =None,llm_indices=None):
         """
         Args:
             x: 全サンプルの特徴量 (batch_size, 256, 1, width)
@@ -492,58 +495,69 @@ class CTCtopB(nn.Module):
         # Final CTC projection
         y_ctc = self.fnl(y_rnn)  # (width, batch, nclasses)
 
-        # LLM処理（use_llm=true かつ 学習時のみ）
+        # LLM処理
         llm_outputs = {}
         if self.use_llm and mobilevit_outputs is not None and transcr_llm is not None and self.training:
-            # 3つのパスで次トークン予測損失を計算
             mvit1_output, mvit2_output = mobilevit_outputs
 
-            # 正解文字列をトークン化
+            if llm_indices is None:
+                raise ValueError("llm_indices must be provided when use_llm is True")
+            # llm_indices: (llm_batch,) LongTensor (GPU) or list
+            if isinstance(llm_indices, torch.Tensor):
+                sel = llm_indices
+            else:
+                sel = torch.as_tensor(llm_indices, dtype=torch.long, device=x.device)
+                
+            # print("🍫"*100)
+            # print("[LLM DEBUG] transcr_llm type:", type(transcr_llm), "len:", len(transcr_llm))
+            # for i, t in enumerate(transcr_llm):
+            #     print(f"[LLM DEBUG] Sample {i}: {t}")
+            # print("🍫"*100)
+
+
+            # トークナイズ
             llm_labels = self.llm.tokenizer(
                 list(transcr_llm),
                 return_tensors="pt",
-                padding=True,  # バッチ内で長さを揃える
+                padding=True,
                 truncation=True,
-                max_length=512  # GPT-2の最大コンテキスト長を考慮
+                max_length=512
             )
-            labels = llm_labels["input_ids"].to(x.device)  # (llm_batch, text_len)
+            input_ids      = llm_labels["input_ids"].to(x.device)             # (B_llm, L)
+            attention_mask = llm_labels["attention_mask"].to(x.device)        # (B_llm, L)
 
-            # GPT-2の埋め込み層でテキスト埋め込みを取得
-            with torch.no_grad():  # クエリとして使うだけなので勾配不要
-                text_embeddings = self.llm.model.transformer.wte(labels)  # (llm_batch, text_len, 768)
+            # ★ PADは-100に（参照側と同条件）
+            labels_masked = input_ids.masked_fill(attention_mask == 0, -100)
 
-            # 各コネクタにテキスト埋め込みを渡す
-            # Q-Formerが画像特徴からテキストに関連する情報を抽出
+            with torch.no_grad():
+                text_embeddings = self.llm.model.transformer.wte(input_ids)
 
-            # 1. MobileViT1出力 → Q-Former → GPT-2入力形式
-            inputs_embeds_mvit1 = self.connector_mvit1(mvit1_output, text_embeddings)  # (llm_batch, text_len, 768)
+            # （比較を公正にするため一時的にFP32で）
+            emb1 = self.connector_mvit1(mvit1_output, text_embeddings).float()
+            emb2 = self.connector_mvit2(mvit2_output, text_embeddings).float()
 
-            # 2. MobileViT2出力 → Q-Former → GPT-2入力形式
-            inputs_embeds_mvit2 = self.connector_mvit2(mvit2_output, text_embeddings)  # (llm_batch, text_len, 768)
+            # Select BiLSTM layer1 outputs for LLM samples
+            # y1: (seq_len, batch, 512) -> y1_llm: (seq_len, llm_batch, 512)
+            if isinstance(sel, torch.Tensor):
+                y1_llm = y1[:, sel, :]
+            else:
+                # handle list-like indices defensively
+                y1_llm = y1[:, torch.as_tensor(sel, dtype=torch.long, device=x.device), :]
 
-            # 3. BiLSTM layer1出力 → Q-Former → GPT-2入力形式
-            y1_llm = y1[:, :text_embeddings.size(0), :]  # (width, llm_batch, 512) - LLMサンプルのみ抽出
-            inputs_embeds_bilstm = self.connector_bilstm(y1_llm.permute(1, 0, 2), text_embeddings)  # (llm_batch, text_len, 768)
+            emb_bilstm = self.connector_bilstm(y1_llm.permute(1, 0, 2), text_embeddings).float()
 
-            # すべて (llm_batch, text_len, 768) で統一されている
-            # 最小長への切り詰め処理は不要（Q-Formerが自動的に調整）
+            # ★ labels=labels_masked, attention_mask=attention_mask を渡す
+            llm_outputs['mobilevit1']    = self.llm(inputs_embeds=emb1,     labels=labels_masked, attention_mask=attention_mask)
+            llm_outputs['mobilevit2']    = self.llm(inputs_embeds=emb2,     labels=labels_masked, attention_mask=attention_mask)
+            llm_outputs['bilstm_layer1'] = self.llm(inputs_embeds=emb_bilstm, labels=labels_masked, attention_mask=attention_mask)
 
-            # 各パスでGPT-2を実行
-            llm_outputs['mobilevit1'] = self.llm(
-                inputs_embeds=inputs_embeds_mvit1.half(),
-                labels=labels
-            )
-
-            llm_outputs['mobilevit2'] = self.llm(
-                inputs_embeds=inputs_embeds_mvit2.half(),
-                labels=labels
-            )
-
-            llm_outputs['bilstm_layer1'] = self.llm(
-                inputs_embeds=inputs_embeds_bilstm.half(),
-                labels=labels
-            )
-
+            # 参照用も返す
+            llm_outputs['input_ids']      = input_ids
+            llm_outputs['label_ids']      = input_ids
+            llm_outputs['attention_mask'] = attention_mask
+            
+            
+            
         if self.training:
             return y_ctc, self.cnn(x).permute(2, 3, 0, 1)[0], llm_outputs
         else:
@@ -578,7 +592,7 @@ class HTRNet(nn.Module):
         elif head=='both':
             self.top = CTCtopB(hidden, (arch_cfg.rnn_hidden_size, arch_cfg.rnn_layers), nclasses, rnn_type=arch_cfg.rnn_type, use_llm=use_llm)
 
-    def forward(self, x, img_llm=None, transcr_llm=None):
+    def forward(self, x, img_llm=None, transcr_llm=None , llm_indices=None):
         """
         Args:
             x: 全サンプルの画像 (batch_size, C, H, W)
@@ -601,7 +615,7 @@ class HTRNet(nn.Module):
 
         # CTCtopBに渡す
         if transcr_llm is not None and mobilevit_outputs_llm is not None:
-            y = self.top(y, mobilevit_outputs=mobilevit_outputs_llm, transcr_llm=transcr_llm)
+            y = self.top(y, mobilevit_outputs=mobilevit_outputs_llm, transcr_llm=transcr_llm,llm_indices = llm_indices)
         else:
             y = self.top(y)
 
@@ -659,4 +673,3 @@ class HTRNet(nn.Module):
         total_params = sum(p.numel() for p in self.parameters())
         print(f"Frozen connector parameters")
         print(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.2f}%)")
-        
